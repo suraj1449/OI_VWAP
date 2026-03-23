@@ -2755,39 +2755,54 @@ if __name__ == "__main__":
         print(f"  ✓  Tokens   = {len(_token_map)} loaded for historical")
         print(f"  ✓  History  = {len(oi_history)} strikes tracked")
 
+    # oi_loop sleeps first; for __main__ we already called fetch_oi() above
     threading.Thread(target=oi_loop,  daemon=True, name="OI-Thread").start()
     threading.Thread(target=ltp_loop, daemon=True, name="LTP-Thread").start()
-    # Note: oi_loop sleeps OI_INTERVAL before first repeat (original design preserved)
 
     print(f"\n  ▶  Open browser →  http://localhost:{port}\n")
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
 
 
 # ═══════════════════════════════════════════════════════════
-#  GUNICORN ENTRY POINT  (used by Render)
-#  Gunicorn imports this module and calls app directly.
-#  The __name__ == "__main__" block above does NOT run.
-#  This section starts the background threads at import time.
+#  THREAD STARTUP  —  works for both  python run  and  gunicorn
+#
+#  WHY NOT module-level _start_threads_once():
+#    Gunicorn always forks a worker from the master process.
+#    Threads started in the master DIE after fork.
+#    The _threads_started flag is already True in the child
+#    (copied from parent memory), so the old approach was a
+#    no-op in the worker → zero threads → oi_data stays {}.
+#
+#  FIX: @app.before_request + PID check.
+#    Fires inside the actual worker process on the very first
+#    HTTP request.  PID comparison guarantees it re-fires
+#    correctly after any fork.
 # ═══════════════════════════════════════════════════════════
-_threads_started = False
 
 def _oi_loop_with_initial():
-    """Run fetch_oi immediately (no initial sleep), then hand off to normal oi_loop."""
-    fetch_oi()                    # first snapshot — no sleep before this one
+    """Fetch OI immediately (no sleep), then repeat every OI_INTERVAL."""
+    fetch_oi()
     time.sleep(OI_INTERVAL)
     while True:
         fetch_oi()
         time.sleep(OI_INTERVAL)
 
-def _start_threads_once():
-    global _threads_started
-    if _threads_started:
-        return
-    _threads_started = True
-    print("  [GUNICORN] Starting background threads (initial OI fetch is non-blocking) …")
-    # fetch_oi() runs inside the thread — does NOT block module import
-    threading.Thread(target=_oi_loop_with_initial, daemon=True, name="OI-Thread").start()
-    threading.Thread(target=ltp_loop,              daemon=True, name="LTP-Thread").start()
-    print("  [GUNICORN] Threads started.")
 
-_start_threads_once()
+_threads_pid  = None
+_threads_lock = threading.Lock()
+
+@app.before_request
+def _ensure_threads():
+    """Start background threads in whichever worker process handles the first request."""
+    global _threads_pid
+    pid = os.getpid()
+    if _threads_pid == pid:
+        return                          # already running in this process — fast path
+    with _threads_lock:
+        if _threads_pid == pid:         # double-checked locking
+            return
+        _threads_pid = pid
+        print(f"  [INIT pid={pid}] Starting OI + LTP threads …")
+        threading.Thread(target=_oi_loop_with_initial, daemon=True, name="OI-Thread").start()
+        threading.Thread(target=ltp_loop,              daemon=True, name="LTP-Thread").start()
+        print(f"  [INIT pid={pid}] Threads started.")
