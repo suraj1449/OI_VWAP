@@ -2739,13 +2739,27 @@ if __name__ == "__main__":
     print("  NIFTY OI Dashboard  v5  (4-Day History Chart)")
     print(f"  OI refresh : {OI_INTERVAL}s   LTP refresh : {LTP_INTERVAL}s")
     print(f"  Strikes    : ATM±{OTM_DEPTH}  ({2*OTM_DEPTH+1} rows total)")
-    print("  Fixes: oi_loop sleeps first · prev==0 → shows NEW")
-    print("  New  : /api/historical_oi   · 4-day OI chart")
     print("="*62)
 
-    start_background_threads()
+    # ── Fetch initial OI synchronously so page has data immediately ──
+    print("\n  → Fetching initial OI snapshot (may take 10-20 sec) …")
+    fetch_oi()
+    if error_msg:
+        print(f"  ⚠  OI fetch error: {error_msg}")
+        print("  ⚠  Dashboard will retry every 3 min. Check credentials.")
+    else:
+        print(f"  ✓  Expiry  = {oi_data.get('expiry')}")
+        print(f"  ✓  ATM     = {oi_data.get('atm')}")
+        print(f"  ✓  Tokens  = {len(_token_map)} loaded")
+
+    # ── Start background refresh threads ──────────────────────────────
+    # oi_loop sleeps OI_INTERVAL before its first call (initial done above)
+    threading.Thread(target=oi_loop,  daemon=True, name="OI-Thread").start()
+    threading.Thread(target=ltp_loop, daemon=True, name="LTP-Thread").start()
+    print("  ✓  Background threads started")
 
     print(f"\n  ▶  Open browser →  http://localhost:{port}\n")
+    # threaded=True lets Flask handle concurrent LTP + OI requests
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
 
 
