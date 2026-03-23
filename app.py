@@ -10,10 +10,16 @@ RENDER DEPLOYMENT CHANGES (logic untouched):
 ═══════════════════════════════════════════════════════════════
 """
 
-import os, time, threading
+import os, time, threading, socket
 from datetime import datetime, date, timedelta
 from flask import Flask, jsonify, render_template_string, request
 from kiteconnect import KiteConnect
+
+# ── Global socket timeout ────────────────────────────────────
+# Prevents kite.instruments() / kite.quote() from hanging
+# forever on Render's network, which blocks the OI thread
+# permanently and leaves oi_data = {} forever.
+socket.setdefaulttimeout(30)   # 30 second max on every network call
 
 # ── ONLY CHANGE: read credentials from environment ──────────
 API_KEY      = os.environ["KITE_API_KEY"]
