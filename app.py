@@ -93,10 +93,18 @@ def load_nifty_instruments():
 
 def get_nearest_expiry():
     global _nearest_expiry
+    # Only download the full instrument list when:
+    #   1. First call (_nearest_expiry is None), or
+    #   2. The cached expiry has already passed (contract rolled over)
+    # This prevents re-downloading ~10,000 records on every 3-min fetch_oi() call.
+    if _nearest_expiry is not None and _nearest_expiry >= date.today():
+        return _nearest_expiry          # fast path — reuse cached expiry
+    print(f"  [INST] Loading instruments (expiry={_nearest_expiry}) …")
     expiries = load_nifty_instruments()
     if not expiries:
         raise RuntimeError("No NIFTY NFO instruments found")
     _nearest_expiry = expiries[0]
+    print(f"  [INST] Nearest expiry = {_nearest_expiry}")
     return _nearest_expiry
 
 
@@ -482,7 +490,10 @@ def fetch_ltp():
 
 def ltp_loop():
     while True:
-        fetch_ltp()
+        try:
+            fetch_ltp()
+        except Exception as e:
+            print(f"  [LTP-Thread] Unexpected error: {e}")
         time.sleep(LTP_INTERVAL)
 
 
@@ -2772,14 +2783,33 @@ def index():
 # ═══════════════════════════════════════════════════════════
 
 def _oi_loop_with_initial():
-    """Fetch OI immediately (no sleep first), then repeat every OI_INTERVAL."""
-    print(f"  [OI-Thread pid={os.getpid()}] Thread alive, calling fetch_oi() now …")
-    fetch_oi()
-    print(f"  [OI-Thread] First fetch_oi() done. error_msg={error_msg}")
-    time.sleep(OI_INTERVAL)
+    """
+    Fetch OI immediately on startup.
+    If the first attempt fails (cold-start network timeout etc.),
+    retry every 10 seconds until it succeeds — then switch to the
+    normal OI_INTERVAL (3-min) cycle.
+    """
+    print(f"  [OI-Thread pid={os.getpid()}] Thread started, fetching initial OI …")
+
+    # ── Phase 1: keep retrying every 10 s until we get real data ────
+    while not oi_data.get("atm"):
+        try:
+            fetch_oi()
+        except Exception as e:
+            print(f"  [OI-Thread] Startup fetch error: {e}")
+        if oi_data.get("atm"):
+            print(f"  [OI-Thread] Initial fetch succeeded. ATM={oi_data.get('atm')}")
+            break
+        print(f"  [OI-Thread] No data yet, retrying in 10 s …")
+        time.sleep(10)
+
+    # ── Phase 2: normal 3-min refresh cycle ─────────────────────────
     while True:
-        fetch_oi()
         time.sleep(OI_INTERVAL)
+        try:
+            fetch_oi()
+        except Exception as e:
+            print(f"  [OI-Thread] fetch error (will retry in {OI_INTERVAL}s): {e}")
 
 
 # ═══════════════════════════════════════════════════════════
