@@ -1,11 +1,12 @@
 """
 NIFTY OI Dashboard  v5  —  4-Day History Chart + All Fixes
 ═══════════════════════════════════════════════════════════════
-Render-ready version: credentials loaded from environment variables.
-
-Set these in Render → Environment Variables (or a local .env file):
-  KITE_API_KEY        your Kite Connect API key
-  KITE_ACCESS_TOKEN   your access token (refreshed daily)
+RENDER DEPLOYMENT CHANGES (logic untouched):
+  • API_KEY and ACCESS_TOKEN now read from environment variables
+    KITE_API_KEY and KITE_ACCESS_TOKEN
+  • PORT read from environment (Render injects this automatically)
+  • _ensure_threads() added at module level so gunicorn starts
+    the OI + LTP background threads on import
 ═══════════════════════════════════════════════════════════════
 """
 
@@ -14,9 +15,10 @@ from datetime import datetime, date, timedelta
 from flask import Flask, jsonify, render_template_string, request
 from kiteconnect import KiteConnect
 
-# ─── Credentials from environment ────────────────────────────────────────────
-API_KEY      = os.environ["KITE_API_KEY"]          # raises KeyError if missing
-ACCESS_TOKEN = os.environ["KITE_ACCESS_TOKEN"]      # raises KeyError if missing
+# ── ONLY CHANGE: read credentials from environment ──────────
+API_KEY      = os.environ["KITE_API_KEY"]
+ACCESS_TOKEN = os.environ["KITE_ACCESS_TOKEN"]
+# ────────────────────────────────────────────────────────────
 
 STRIKE_GAP   = 50
 OTM_DEPTH    = 5        # 11 strikes total
@@ -33,16 +35,18 @@ last_oi_time = None
 error_msg    = None
 ltp_symbols  = []
 
-_prev_oi        = {}
-_instrument_map = {}
-_token_map      = {}
-_sym_to_token   = {}
-_nearest_expiry = None
+_prev_oi        = {}   # sym → last-snapshot OI  (for Δ calc)
+_instrument_map = {}   # (strike, type, expiry) → "NFO:symbol"
+_token_map      = {}   # (strike, type, expiry) → instrument_token (int)
+_sym_to_token   = {}   # "NFO:NIFTYYYMDDSTRIKEXX" → instrument_token  (reverse map)
+_nearest_expiry = None # cached expiry date
 
+# Live OI snapshots: {strike_int: [{t:"DD-MMM HH:MM", ce:int, pe:int}, ...]}
 oi_history: dict[int, list] = {}
 
+# Historical OI cache: {strike_int: {"fetched_at":datetime, "ts":[], "ce":[], "pe":[]}}
 _hist_cache: dict[int, dict] = {}
-HIST_CACHE_TTL = 1800
+HIST_CACHE_TTL = 1800   # 30 min — re-fetch historical if older than this
 
 
 # ═══════════════════════════════════════════════════════════
@@ -63,6 +67,7 @@ def load_nifty_instruments():
         if inst["instrument_type"] not in ("CE", "PE"):
             continue
         exp = inst["expiry"]
+        # Normalize: kiteconnect may return datetime or date depending on version
         if hasattr(exp, "date"):
             exp = exp.date()
         if exp < today:
@@ -90,25 +95,35 @@ def get_nearest_expiry():
 
 
 def zerodha_expiry_code(expiry):
+    """
+    Weekly : NIFTY{YY}{M}{DD}  e.g. NIFTY26324  (year=26, month-code=3, day=24)
+    Monthly: NIFTY{YY}{MON}    e.g. NIFTY26MAR  (year=26, March)
+
+    is_monthly = True when this is the LAST occurrence of this weekday in the month.
+    Works for any expiry day: Tuesday (NIFTY), Thursday (old NIFTY/BANKNIFTY), etc.
+    """
     MONTH_CODE = {1:"1",2:"2",3:"3",4:"4",5:"5",
                   6:"6",7:"7",8:"8",9:"9",
                   10:"O",11:"N",12:"D"}
     import calendar
     yr, mo, dy = expiry.year, expiry.month, expiry.day
-    last_day       = calendar.monthrange(yr, mo)[1]
-    expiry_weekday = expiry.weekday()
+    last_day        = calendar.monthrange(yr, mo)[1]
+    expiry_weekday  = expiry.weekday()   # 0=Mon … 6=Sun; Tuesday=1, Thursday=3
+
+    # Monthly = no further occurrence of the SAME weekday left in this month
     is_monthly = True
     for d in range(dy + 1, last_day + 1):
         if date(yr, mo, d).weekday() == expiry_weekday:
             is_monthly = False
             break
+
     yy = str(yr)[-2:]
     if is_monthly:
-        return f"{yy}{expiry.strftime('%b').upper()}"
+        return f"{yy}{expiry.strftime('%b').upper()}"   # e.g. "26MAR"
     else:
         mc = MONTH_CODE[mo]
         dd = f"{dy:02d}"
-        return f"{yy}{mc}{dd}"
+        return f"{yy}{mc}{dd}"                          # e.g. "26324"
 
 
 def opt_sym(strike, kind, expiry):
@@ -129,36 +144,54 @@ def round_atm(price):
 
 
 # ═══════════════════════════════════════════════════════════
-#  OI Δ
+#  OI Δ  (FIXED)
+#  Bug was: oi_loop called fetch_oi() immediately with no
+#  initial sleep, so snapshot 2 was taken milliseconds after
+#  snapshot 1 → diff = 0, pct = 0.0 every single time.
+#  Fix: oi_loop sleeps FIRST (see oi_loop below).
+#
+#  Second bug: when prev == 0, pct = 0.0 incorrectly.
+#  Fix: return (diff, None) so frontend shows "NEW OI" pill.
 # ═══════════════════════════════════════════════════════════
 
 def oi_change(sym, cur):
     prev = _prev_oi.get(sym)
-    if prev is None:
+    if prev is None:                # first-ever snapshot
         return None, None
     diff = cur - prev
-    if prev == 0:
-        return diff, None
+    if prev == 0:                   # previous OI was 0 → new position
+        return diff, None           # pct undefined; frontend shows NEW
     pct = round((diff / prev) * 100, 2)
     return diff, pct
 
 
 # ═══════════════════════════════════════════════════════════
-#  HISTORICAL OI
+#  HISTORICAL OI  (Kite historical_data API)
 # ═══════════════════════════════════════════════════════════
 
 def _fetch_historical_for_strike(strike: int) -> dict:
+    """
+    Fetch 3-day historical 3-min candles for strike's CE & PE.
+    Returns {"ts":[...], "ce":[...], "pe":[...]} or raises.
+    Timestamps formatted as "DD-MMM HH:MM".
+    """
     expiry = _nearest_expiry
     if expiry is None:
         raise RuntimeError("Expiry not loaded yet")
+
     ce_tok = _token_map.get((strike, "CE", expiry))
     pe_tok = _token_map.get((strike, "PE", expiry))
     if not ce_tok or not pe_tok:
         raise RuntimeError(f"Tokens not found for strike {strike}")
+
+    # Go back 5 calendar days to guarantee ≥3 trading days
     from_dt = date.today() - timedelta(days=5)
     to_dt   = date.today()
+
     ce_raw = kite.historical_data(ce_tok, from_dt, to_dt, "3minute", oi=True)
     pe_raw = kite.historical_data(pe_tok, from_dt, to_dt, "3minute", oi=True)
+
+    # Build time-keyed dict; prefer CE+PE both present
     ts_map: dict[str, dict] = {}
     for c in ce_raw:
         lbl = c["date"].strftime("%d-%b %H:%M")
@@ -166,6 +199,7 @@ def _fetch_historical_for_strike(strike: int) -> dict:
     for c in pe_raw:
         lbl = c["date"].strftime("%d-%b %H:%M")
         ts_map.setdefault(lbl, {})["pe"] = c.get("oi", 0)
+
     sorted_ts = sorted(ts_map.keys())
     return {
         "ts": sorted_ts,
@@ -175,14 +209,21 @@ def _fetch_historical_for_strike(strike: int) -> dict:
 
 
 def _fetch_historical_total() -> dict:
+    """
+    Fetch 3-day historical 3-min candles for ALL current ATM±5 strikes
+    and return summed CE + PE OI per timestamp.
+    """
     expiry = _nearest_expiry
     atm    = oi_data.get("atm")
     if expiry is None or not atm:
         raise RuntimeError("Expiry or ATM not loaded yet")
+
     from_dt = date.today() - timedelta(days=5)
     to_dt   = date.today()
+
     ts_ce: dict[str, int] = {}
     ts_pe: dict[str, int] = {}
+
     for offset in range(-OTM_DEPTH, OTM_DEPTH + 1):
         strike = atm + offset * STRIKE_GAP
         ce_tok = _token_map.get((int(strike), "CE", expiry))
@@ -196,12 +237,14 @@ def _fetch_historical_total() -> dict:
         except Exception as e:
             print(f"  [HIST-TOTAL] Failed for strike {strike}: {e}")
             continue
+
         for c in ce_raw:
             lbl = c["date"].strftime("%d-%b %H:%M")
             ts_ce[lbl] = ts_ce.get(lbl, 0) + (c.get("oi") or 0)
         for c in pe_raw:
             lbl = c["date"].strftime("%d-%b %H:%M")
             ts_pe[lbl] = ts_pe.get(lbl, 0) + (c.get("oi") or 0)
+
     all_ts = sorted(set(ts_ce) | set(ts_pe))
     return {
         "ts": all_ts,
@@ -211,17 +254,27 @@ def _fetch_historical_total() -> dict:
 
 
 def _fetch_historical_otm() -> dict:
+    """
+    Fetch 3-day historical OI for OTM-only strikes:
+      CE: ATM+1 to ATM+5  (offset > 0) — OTM calls
+      PE: ATM-1 to ATM-5  (offset < 0) — OTM puts
+      ATM (offset=0) is excluded.
+    Returns {"ts":[...], "ce":[...], "pe":[...]}
+    """
     expiry = _nearest_expiry
     atm    = oi_data.get("atm")
     if expiry is None or not atm:
         raise RuntimeError("Expiry or ATM not loaded yet")
+
     from_dt = date.today() - timedelta(days=5)
     to_dt   = date.today()
+
     ts_ce: dict[str, int] = {}
     ts_pe: dict[str, int] = {}
+
     for offset in range(-OTM_DEPTH, OTM_DEPTH + 1):
         if offset == 0:
-            continue
+            continue   # skip ATM
         strike = atm + offset * STRIKE_GAP
         ce_tok = _token_map.get((int(strike), "CE", expiry))
         pe_tok = _token_map.get((int(strike), "PE", expiry))
@@ -234,14 +287,19 @@ def _fetch_historical_otm() -> dict:
         except Exception as e:
             print(f"  [HIST-OTM] Failed for strike {strike}: {e}")
             continue
+
+        # CE side: only OTM calls (offset > 0)
         if offset > 0:
             for c in ce_raw:
                 lbl = c["date"].strftime("%d-%b %H:%M")
                 ts_ce[lbl] = ts_ce.get(lbl, 0) + (c.get("oi") or 0)
+
+        # PE side: only OTM puts (offset < 0)
         if offset < 0:
             for c in pe_raw:
                 lbl = c["date"].strftime("%d-%b %H:%M")
                 ts_pe[lbl] = ts_pe.get(lbl, 0) + (c.get("oi") or 0)
+
     all_ts = sorted(set(ts_ce) | set(ts_pe))
     return {
         "ts": all_ts,
@@ -251,10 +309,18 @@ def _fetch_historical_otm() -> dict:
 
 
 def _merge_hist_total_with_live(hist: dict) -> dict:
+    """
+    Overlay today's live total OI snapshots on the historical base.
+    Only appends live points that don't already exist in historical data,
+    or updates the last point if they match.
+    """
+    # Start from historical data as the base
     ts_map: dict[str, dict] = {
         t: {"ce": hist["ce"][i], "pe": hist["pe"][i]}
         for i, t in enumerate(hist["ts"])
     }
+
+    # Compute live totals per timestamp (sum across all tracked strikes)
     live_ts: dict[str, dict] = {}
     for sk_pts in oi_history.values():
         for pt in sk_pts:
@@ -263,8 +329,11 @@ def _merge_hist_total_with_live(hist: dict) -> dict:
                 live_ts[t] = {"ce": 0, "pe": 0}
             live_ts[t]["ce"] += pt["ce"]
             live_ts[t]["pe"] += pt["pe"]
+
+    # Merge: live data overlays historical for same ts, and adds new live ts
     for t, v in live_ts.items():
         ts_map[t] = v
+
     sorted_ts = sorted(ts_map.keys())
     return {
         "ts": sorted_ts,
@@ -273,17 +342,23 @@ def _merge_hist_total_with_live(hist: dict) -> dict:
     }
 
 
+# Cache key for total historical
 _hist_total_cache: dict = {}
 HIST_TOTAL_CACHE_KEY = "total"
 
 
 def _merge_hist_with_live(strike: int, hist: dict) -> dict:
+    """
+    Overlay today's live oi_history snapshots on top of the
+    historical base.  Live data wins on any duplicate timestamp.
+    """
     ts_map: dict[str, dict] = {
         t: {"ce": hist["ce"][i], "pe": hist["pe"][i]}
         for i, t in enumerate(hist["ts"])
     }
     for pt in oi_history.get(strike, []):
         ts_map[pt["t"]] = {"ce": pt["ce"], "pe": pt["pe"]}
+
     sorted_ts = sorted(ts_map.keys())
     return {
         "ts": sorted_ts,
@@ -293,7 +368,7 @@ def _merge_hist_with_live(strike: int, hist: dict) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════
-#  OI FETCH
+#  OI FETCH  (every 3 min)
 # ═══════════════════════════════════════════════════════════
 
 def fetch_oi():
@@ -317,6 +392,7 @@ def fetch_oi():
         new_snap = {}
         result_rows = []
         total_ce = total_pe = 0
+        # Use full date-time so chart x-axis shows "DD-MMM HH:MM"
         ts_now = datetime.now().strftime("%d-%b %H:%M")
 
         for r in rows:
@@ -360,7 +436,7 @@ def fetch_oi():
             "expiry": expiry.strftime("%d %b %Y"),
             "rows": result_rows,
             "total_ce": total_ce, "total_pe": total_pe, "pcr": pcr,
-            "ts_chart": ts_now,
+            "ts_chart": ts_now,   # "DD-MMM HH:MM" for chart append
         }
         last_oi_time = datetime.now().strftime("%H:%M:%S")
         error_msg    = None
@@ -373,6 +449,8 @@ def fetch_oi():
 
 
 def oi_loop():
+    # ── CRITICAL FIX: sleep FIRST so the 2nd snapshot is never ──
+    # taken milliseconds after the 1st (which always gives 0 Δ).  ──
     time.sleep(OI_INTERVAL)
     while True:
         fetch_oi()
@@ -406,6 +484,7 @@ def ltp_loop():
 
 @app.route("/api/debug")
 def api_debug():
+    """Shows loaded state — open in browser to diagnose symbol/token issues."""
     expiry   = _nearest_expiry
     atm      = oi_data.get("atm")
     exp_code = zerodha_expiry_code(expiry) if expiry else "?"
@@ -449,13 +528,22 @@ def api_ltp():
 
 @app.route("/api/historical_oi")
 def api_historical_oi():
+    """
+    Returns merged 4-day OI (3 historical + today live) for one strike.
+    Query param: ?strike=24500
+    Response: {"ts":[], "ce":[], "pe":[], "source":"historical+live"|"live_only"}
+    """
     strike = request.args.get("strike", type=int)
     if not strike:
         return jsonify({"error": "strike param required"}), 400
+
+    # ── Try to return from server cache ───────────────────
     cached = _hist_cache.get(strike)
     if cached and (datetime.now() - cached["fetched_at"]).total_seconds() < HIST_CACHE_TTL:
         merged = _merge_hist_with_live(strike, cached)
         return jsonify({**merged, "source": "historical+live"})
+
+    # ── Fetch fresh historical data from Kite ─────────────
     try:
         hist = _fetch_historical_for_strike(strike)
         _hist_cache[strike] = {**hist, "fetched_at": datetime.now()}
@@ -463,6 +551,7 @@ def api_historical_oi():
         return jsonify({**merged, "source": "historical+live"})
     except Exception as e:
         print(f"  [HIST] Failed for strike {strike}: {e}")
+        # Fallback: return live-only data
         live = oi_history.get(strike, [])
         return jsonify({
             "ts":  [p["t"]  for p in live],
@@ -475,10 +564,17 @@ def api_historical_oi():
 
 @app.route("/api/historical_oi_total")
 def api_historical_oi_total():
+    """
+    Returns merged 4-day TOTAL OI (sum of all 11 strikes' CE + PE) with today live.
+    Response: {"ts":[], "ce":[], "pe":[], "source":"historical+live"|"live_only"}
+    """
+    # ── Try server cache ──────────────────────────────────────
     cached = _hist_total_cache.get(HIST_TOTAL_CACHE_KEY)
     if cached and (datetime.now() - cached["fetched_at"]).total_seconds() < HIST_CACHE_TTL:
         merged = _merge_hist_total_with_live(cached)
         return jsonify({**merged, "source": "historical+live"})
+
+    # ── Fetch fresh ───────────────────────────────────────────
     try:
         hist = _fetch_historical_total()
         _hist_total_cache[HIST_TOTAL_CACHE_KEY] = {**hist, "fetched_at": datetime.now()}
@@ -486,6 +582,8 @@ def api_historical_oi_total():
         return jsonify({**merged, "source": "historical+live"})
     except Exception as e:
         import traceback; traceback.print_exc()
+        print(f"  [HIST-TOTAL] Failed: {e}")
+        # Fallback: build live-only total from oi_history
         merged = _merge_hist_total_with_live({"ts": [], "ce": [], "pe": []})
         return jsonify({**merged, "source": "live_only", "error": str(e)})
 
@@ -495,25 +593,29 @@ HIST_OTM_CACHE_KEY = "otm"
 
 
 def _merge_hist_otm_with_live(hist: dict) -> dict:
+    """Overlay live OTM data (from oi_history, offset!=0) on top of historical OTM."""
     ts_map: dict[str, dict] = {
         t: {"ce": hist["ce"][i], "pe": hist["pe"][i]}
         for i, t in enumerate(hist["ts"])
     }
+    # Build live OTM totals from oi_history
+    # We need to know which strikes are OTM. Use current oi_data rows.
     live_ts: dict[str, dict] = {}
     for row in oi_data.get("rows", []):
-        if row.get("offset", 0) == 0:
+        if row.get("offset", 0) == 0:   # skip ATM
             continue
         sk = int(row["strike"])
         for pt in oi_history.get(sk, []):
             t = pt["t"]
             if t not in live_ts:
                 live_ts[t] = {"ce": 0, "pe": 0}
-            if row["offset"] > 0:
+            if row["offset"] > 0:       # OTM call side
                 live_ts[t]["ce"] += pt["ce"]
-            if row["offset"] < 0:
+            if row["offset"] < 0:       # OTM put side
                 live_ts[t]["pe"] += pt["pe"]
     for t, v in live_ts.items():
         ts_map[t] = v
+
     sorted_ts = sorted(ts_map.keys())
     return {
         "ts": sorted_ts,
@@ -524,10 +626,17 @@ def _merge_hist_otm_with_live(hist: dict) -> dict:
 
 @app.route("/api/historical_oi_otm")
 def api_historical_oi_otm():
+    """
+    Returns merged 4-day OTM-only OI:
+      CE = sum of ATM+1…+5 CE OI  (OTM calls)
+      PE = sum of ATM-1…-5 PE OI  (OTM puts)
+    ATM strike is excluded.
+    """
     cached = _hist_otm_cache.get(HIST_OTM_CACHE_KEY)
     if cached and (datetime.now() - cached["fetched_at"]).total_seconds() < HIST_CACHE_TTL:
         merged = _merge_hist_otm_with_live(cached)
         return jsonify({**merged, "source": "historical+live"})
+
     try:
         hist = _fetch_historical_otm()
         _hist_otm_cache[HIST_OTM_CACHE_KEY] = {**hist, "fetched_at": datetime.now()}
@@ -535,30 +644,44 @@ def api_historical_oi_otm():
         return jsonify({**merged, "source": "historical+live"})
     except Exception as e:
         import traceback; traceback.print_exc()
+        print(f"  [HIST-OTM] Failed: {e}")
         merged = _merge_hist_otm_with_live({"ts": [], "ce": [], "pe": []})
         return jsonify({**merged, "source": "live_only", "error": str(e)})
-
-
 _pv_cache: dict = {}
-PV_CACHE_TTL = 60
+PV_CACHE_TTL = 60   # seconds — refresh price data every minute
+
+
+def _compute_vwap(candles: list) -> list:
+    """Cumulative VWAP from first candle of the day."""
+    cum_tp_vol = 0.0
+    cum_vol    = 0.0
+    out = []
+    for c in candles:
+        tp = (c["high"] + c["low"] + c["close"]) / 3.0
+        cum_tp_vol += tp * (c["volume"] or 0)
+        cum_vol    += (c["volume"] or 0)
+        out.append(round(cum_tp_vol / cum_vol, 2) if cum_vol else round(c["close"], 2))
+    return out
 
 
 @app.route("/api/debug_tokens")
 def api_debug_tokens():
+    """Quick diagnostic: shows nearest expiry, token count, and lookup result for a strike."""
     strike = request.args.get("strike", type=int) or (oi_data.get("atm") if oi_data else None)
     result = {
-        "nearest_expiry"     : str(_nearest_expiry),
-        "token_map_size"     : len(_token_map),
+        "nearest_expiry"  : str(_nearest_expiry),
+        "token_map_size"  : len(_token_map),
         "instrument_map_size": len(_instrument_map),
     }
     if strike and _nearest_expiry:
         ce_key = (int(strike), "CE", _nearest_expiry)
         pe_key = (int(strike), "PE", _nearest_expiry)
-        result["strike"]   = strike
-        result["ce_token"] = _token_map.get(ce_key, "NOT FOUND")
-        result["pe_token"] = _token_map.get(pe_key, "NOT FOUND")
-        result["ce_sym"]   = _instrument_map.get(ce_key, "NOT FOUND")
-        result["pe_sym"]   = _instrument_map.get(pe_key, "NOT FOUND")
+        result["strike"]    = strike
+        result["ce_token"]  = _token_map.get(ce_key, "NOT FOUND")
+        result["pe_token"]  = _token_map.get(pe_key, "NOT FOUND")
+        result["ce_sym"]    = _instrument_map.get(ce_key, "NOT FOUND")
+        result["pe_sym"]    = _instrument_map.get(pe_key, "NOT FOUND")
+        # Show a sample of what IS in the map for context
         sample = [(str(k), v) for k, v in list(_token_map.items())[:5]]
         result["sample_keys"] = sample
     return jsonify(result)
@@ -566,6 +689,11 @@ def api_debug_tokens():
 
 @app.route("/api/price_vwap")
 def api_price_vwap():
+    """
+    Returns today's intraday price + VWAP.
+    Preferred query: ?ce_sym=NFO:NIFTY26327{strike}CE&pe_sym=...&tf=1
+    Fallback query : ?strike=24500&tf=1  (uses _sym_to_token reverse map)
+    """
     tf = request.args.get("tf", default=1, type=int)
     if tf not in (1, 3, 5, 10):
         tf = 1
@@ -573,6 +701,7 @@ def api_price_vwap():
     ce_sym = request.args.get("ce_sym", "").strip()
     pe_sym = request.args.get("pe_sym", "").strip()
 
+    # ── Fallback: derive symbols from strike ─────────────────────
     if not ce_sym or not pe_sym:
         strike = request.args.get("strike", type=int)
         if not strike:
@@ -590,6 +719,7 @@ def api_price_vwap():
                           f"Check /api/debug_tokens?strike={strike}")
             }), 404
 
+    # ── Token lookup via reverse map ──────────────────────────────
     ce_tok = _sym_to_token.get(ce_sym)
     pe_tok = _sym_to_token.get(pe_sym)
     if not ce_tok or not pe_tok:
@@ -605,12 +735,14 @@ def api_price_vwap():
                         "ce_sym": ce_sym, "pe_sym": pe_sym})
 
     today_d = date.today()
+    # Kite API uses "minute" for 1-min, "3minute" / "5minute" / "10minute" for others
     tf_str = "minute" if tf == 1 else f"{tf}minute"
     try:
         ce_raw = kite.historical_data(ce_tok, today_d, today_d, tf_str)
         pe_raw = kite.historical_data(pe_tok, today_d, today_d, tf_str)
 
         def full_day_slots(tf_mins):
+            """Generate all HH:MM slots from 09:15 to 15:30 for a given timeframe."""
             from datetime import time as dtime
             slots = []
             h, m = 9, 15
@@ -623,8 +755,10 @@ def api_price_vwap():
             return slots
 
         def to_series(candles, tf_mins):
+            # Build a map of time → candle data
             candle_map = {c["date"].strftime("%H:%M"): c for c in candles}
             slots = full_day_slots(tf_mins)
+            # Cumulative VWAP state needs sequential processing
             cum_tp_vol = 0.0
             cum_vol    = 0.0
             ts_out, price_out, vwap_out = [], [], []
@@ -638,7 +772,7 @@ def api_price_vwap():
                     price_out.append(round(c["close"], 2))
                     vwap_out.append(round(cum_tp_vol / cum_vol, 2) if cum_vol else round(c["close"], 2))
                 else:
-                    price_out.append(None)
+                    price_out.append(None)   # null = no data yet (future slot)
                     vwap_out.append(None)
             return {"ts": ts_out, "price": price_out, "vwap": vwap_out}
 
@@ -652,7 +786,7 @@ def api_price_vwap():
 
 
 # ═══════════════════════════════════════════════════════════
-#  HTML  (unchanged from v5)
+#  HTML  — 100% unchanged from original v5
 # ═══════════════════════════════════════════════════════════
 
 HTML = r"""<!DOCTYPE html>
@@ -891,13 +1025,17 @@ tfoot td{padding:9px 10px;font-family:'IBM Plex Mono',monospace;font-size:.78rem
 .tot-pcr{text-align:center;font-size:.72rem;font-weight:700}
 
 /* ══════════════════════════════════════════════════════════
-   CHART CARD
+   CHART CARD  —  full-width with strike selector above
 ══════════════════════════════════════════════════════════ */
 .chart-card{
   background:var(--s1);border:1px solid var(--brd);border-radius:8px;
   overflow:hidden;margin-bottom:18px;box-shadow:var(--shadow);transition:background .3s;
 }
-.chart-hd{padding:13px 18px 12px;border-bottom:1px solid var(--brd);background:var(--s2);}
+
+/* ── header row ── */
+.chart-hd{
+  padding:13px 18px 12px;border-bottom:1px solid var(--brd);background:var(--s2);
+}
 .chart-hd-top{
   display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;
   margin-bottom:10px;
@@ -905,108 +1043,272 @@ tfoot td{padding:9px 10px;font-family:'IBM Plex Mono',monospace;font-size:.78rem
 .chart-title{font-size:.86rem;font-weight:700;letter-spacing:.04em;
   display:flex;align-items:center;gap:8px;color:var(--text)}
 .chart-title svg{width:16px;height:16px;stroke:var(--ce);flex-shrink:0}
+
+/* live meta pills */
 .chart-meta{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 .cmeta{
   display:flex;align-items:center;gap:5px;
   font-size:.64rem;font-family:'IBM Plex Mono',monospace;
   padding:4px 11px;border-radius:50px;
-  border:1px solid var(--brd);background:var(--s1);color:var(--muted);white-space:nowrap;
+  border:1px solid var(--brd);background:var(--s1);color:var(--muted);
+  white-space:nowrap;
 }
 .cmeta b{font-weight:700}
 .cm-ce{color:var(--ce)!important;border-color:rgba(0,212,160,.3)!important;background:rgba(0,212,160,.06)!important}
 .cm-pe{color:var(--pe)!important;border-color:rgba(255,63,108,.3)!important;background:rgba(255,63,108,.06)!important}
 [data-theme="day"] .cm-ce{background:rgba(0,122,92,.06)!important;border-color:rgba(0,122,92,.3)!important}
 [data-theme="day"] .cm-pe{background:rgba(181,21,50,.06)!important;border-color:rgba(181,21,50,.3)!important}
-.src-badge{font-size:.58rem;font-family:'IBM Plex Mono',monospace;font-weight:700;padding:3px 9px;border-radius:50px;letter-spacing:.06em;}
+
+/* source badge */
+.src-badge{
+  font-size:.58rem;font-family:'IBM Plex Mono',monospace;font-weight:700;
+  padding:3px 9px;border-radius:50px;letter-spacing:.06em;
+}
 .src-hist{background:rgba(107,180,255,.1);color:#6bacd6;border:1px solid rgba(107,180,255,.3)}
 .src-live{background:rgba(251,191,36,.1);color:var(--gold);border:1px solid rgba(251,191,36,.3)}
-.chart-sel-row{display:flex;align-items:center;gap:12px;flex-wrap:wrap;}
-.chart-sel-lbl{font-size:.66rem;font-family:'IBM Plex Mono',monospace;color:var(--muted);white-space:nowrap;flex-shrink:0;}
-.strike-btns{display:flex;align-items:center;gap:6px;flex-wrap:wrap;flex:1;}
+
+/* ── strike selector row — full width ── */
+.chart-sel-row{
+  display:flex;align-items:center;gap:12px;flex-wrap:wrap;
+}
+.chart-sel-lbl{
+  font-size:.66rem;font-family:'IBM Plex Mono',monospace;color:var(--muted);
+  white-space:nowrap;flex-shrink:0;
+}
+
+/* pill buttons for each strike */
+.strike-btns{
+  display:flex;align-items:center;gap:6px;flex-wrap:wrap;flex:1;
+}
 .sk-btn{
-  cursor:pointer;font-family:'IBM Plex Mono',monospace;font-size:.72rem;font-weight:600;
+  cursor:pointer;
+  font-family:'IBM Plex Mono',monospace;font-size:.72rem;font-weight:600;
   padding:5px 13px;border-radius:6px;border:1px solid var(--brd);
-  background:var(--s1);color:var(--muted);transition:all .18s;user-select:none;white-space:nowrap;
+  background:var(--s1);color:var(--muted);
+  transition:all .18s;user-select:none;white-space:nowrap;
 }
 .sk-btn:hover{border-color:var(--ce);color:var(--text)}
-.sk-btn.active{background:rgba(0,212,160,.12);border-color:var(--ce);color:var(--ce);box-shadow:0 0 0 2px rgba(0,212,160,.18);}
-.sk-btn.sk-atm{background:rgba(251,191,36,.1);border-color:var(--gold);color:var(--gold);font-weight:700;}
-.sk-btn.sk-atm.active{background:rgba(251,191,36,.2);box-shadow:0 0 0 2px rgba(251,191,36,.25);}
-.sk-btn.sk-total{background:rgba(107,124,255,.08);border-color:rgba(107,124,255,.4);color:#8b9eff;font-weight:700;}
-.sk-btn.sk-total.active{background:rgba(107,124,255,.18);border-color:#8b9eff;color:#c0caffff;box-shadow:0 0 0 2px rgba(107,124,255,.25);}
-.sk-btn.sk-otm{background:rgba(251,191,36,.07);border-color:rgba(251,191,36,.35);color:#d4a800;font-weight:700;}
-.sk-btn.sk-otm.active{background:rgba(251,191,36,.18);border-color:var(--gold);color:var(--gold);box-shadow:0 0 0 2px rgba(251,191,36,.25);}
+.sk-btn.active{
+  background:rgba(0,212,160,.12);border-color:var(--ce);
+  color:var(--ce);box-shadow:0 0 0 2px rgba(0,212,160,.18);
+}
+.sk-btn.sk-atm{
+  background:rgba(251,191,36,.1);border-color:var(--gold);color:var(--gold);font-weight:700;
+}
+.sk-btn.sk-atm.active{
+  background:rgba(251,191,36,.2);box-shadow:0 0 0 2px rgba(251,191,36,.25);
+}
+.sk-btn.sk-total{
+  background:rgba(107,124,255,.08);border-color:rgba(107,124,255,.4);
+  color:#8b9eff;font-weight:700;
+}
+.sk-btn.sk-total.active{
+  background:rgba(107,124,255,.18);border-color:#8b9eff;
+  color:#c0caffff;box-shadow:0 0 0 2px rgba(107,124,255,.25);
+}
+.sk-btn.sk-otm{
+  background:rgba(251,191,36,.07);border-color:rgba(251,191,36,.35);
+  color:#d4a800;font-weight:700;
+}
+.sk-btn.sk-otm.active{
+  background:rgba(251,191,36,.18);border-color:var(--gold);
+  color:var(--gold);box-shadow:0 0 0 2px rgba(251,191,36,.25);
+}
 [data-theme="day"] .sk-btn.sk-otm{background:rgba(154,103,0,.07);border-color:rgba(154,103,0,.4);color:var(--gold)}
 [data-theme="day"] .sk-btn.sk-otm.active{background:rgba(154,103,0,.16);border-color:var(--gold)}
 .sk-btn.sk-ce{border-color:rgba(0,212,160,.3)}
 .sk-btn.sk-pe{border-color:rgba(255,63,108,.3)}
 [data-theme="day"] .sk-btn.active{background:rgba(0,122,92,.1);border-color:var(--ce);color:var(--ce)}
 [data-theme="day"] .sk-btn.sk-atm{background:rgba(154,103,0,.07);border-color:var(--gold);color:var(--gold)}
-.day-filter-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:10px 18px 12px;border-bottom:1px solid var(--brd);background:var(--s2);}
-.day-filter-lbl{font-size:.65rem;font-family:'IBM Plex Mono',monospace;color:var(--muted);white-space:nowrap;flex-shrink:0;margin-right:4px;}
-.day-btn{cursor:pointer;font-family:'IBM Plex Mono',monospace;font-size:.72rem;font-weight:600;padding:5px 16px;border-radius:6px;border:1px solid var(--brd);background:var(--s1);color:var(--muted);transition:all .18s;user-select:none;white-space:nowrap;}
+
+/* ── day filter buttons ── */
+.day-filter-row{
+  display:flex;align-items:center;gap:8px;flex-wrap:wrap;
+  padding:10px 18px 12px;border-bottom:1px solid var(--brd);background:var(--s2);
+}
+.day-filter-lbl{
+  font-size:.65rem;font-family:'IBM Plex Mono',monospace;color:var(--muted);
+  white-space:nowrap;flex-shrink:0;margin-right:4px;
+}
+.day-btn{
+  cursor:pointer;
+  font-family:'IBM Plex Mono',monospace;font-size:.72rem;font-weight:600;
+  padding:5px 16px;border-radius:6px;border:1px solid var(--brd);
+  background:var(--s1);color:var(--muted);
+  transition:all .18s;user-select:none;white-space:nowrap;
+}
 .day-btn:hover{border-color:var(--gold);color:var(--text)}
-.day-btn.active{background:rgba(251,191,36,.14);border-color:var(--gold);color:var(--gold);font-weight:700;box-shadow:0 0 0 2px rgba(251,191,36,.2);}
+.day-btn.active{
+  background:rgba(251,191,36,.14);border-color:var(--gold);
+  color:var(--gold);font-weight:700;box-shadow:0 0 0 2px rgba(251,191,36,.2);
+}
 [data-theme="day"] .day-btn.active{background:rgba(154,103,0,.1);border-color:var(--gold);color:var(--gold)}
 .day-btn-sep{width:1px;height:22px;background:var(--brd);margin:0 4px;flex-shrink:0}
+
+/* ── chart body ── */
 .chart-canvas-wrap{position:relative;height:420px;min-height:420px}
-.chart-body{padding:16px 20px 0;background:var(--chart-bg);transition:background .3s;position:relative;min-height:460px;}
-.chart-spinner{position:absolute;inset:0;display:none;flex-direction:column;align-items:center;justify-content:center;gap:14px;z-index:10;background:var(--chart-bg);}
+.chart-body{
+  padding:16px 20px 0;background:var(--chart-bg);transition:background .3s;position:relative;
+  min-height:460px;
+}
+.chart-spinner{
+  position:absolute;inset:0;display:none;flex-direction:column;
+  align-items:center;justify-content:center;gap:14px;z-index:10;
+  background:var(--chart-bg);
+}
 .chart-spinner.show{display:flex}
-.spinner-ring{width:42px;height:42px;border:3px solid var(--brd);border-top-color:var(--ce);border-radius:50%;animation:spin .8s linear infinite;}
+.spinner-ring{
+  width:42px;height:42px;border:3px solid var(--brd);
+  border-top-color:var(--ce);border-radius:50%;
+  animation:spin .8s linear infinite;
+}
 @keyframes spin{to{transform:rotate(360deg)}}
 .spinner-txt{font-family:'IBM Plex Mono',monospace;font-size:.72rem;color:var(--muted)}
-.chart-placeholder{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;color:var(--muted);font-family:'IBM Plex Mono',monospace;font-size:.76rem;}
+.chart-placeholder{
+  position:absolute;inset:0;display:flex;flex-direction:column;
+  align-items:center;justify-content:center;gap:12px;
+  color:var(--muted);font-family:'IBM Plex Mono',monospace;font-size:.76rem;
+}
 .chart-placeholder svg{opacity:.25;width:50px;height:50px;stroke:var(--muted)}
 .chart-placeholder p{opacity:.5;text-align:center;line-height:1.6}
 canvas#oi-chart{display:none;width:100%!important;height:420px!important}
-.chart-legend{display:flex;align-items:center;justify-content:center;gap:24px;padding:11px 0 9px;flex-wrap:wrap;background:var(--chart-bg);}
-.leg-item{display:flex;align-items:center;gap:7px;font-size:.65rem;font-family:'IBM Plex Mono',monospace;color:var(--muted)}
+
+/* legend + footer */
+.chart-legend{
+  display:flex;align-items:center;justify-content:center;gap:24px;
+  padding:11px 0 9px;flex-wrap:wrap;background:var(--chart-bg);
+}
+.leg-item{display:flex;align-items:center;gap:7px;
+  font-size:.65rem;font-family:'IBM Plex Mono',monospace;color:var(--muted)}
 .leg-sw{width:28px;height:3px;border-radius:2px;flex-shrink:0}
 .leg-dot{width:9px;height:9px;border-radius:50%;flex-shrink:0;opacity:.75}
-.chart-foot{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;padding:9px 20px 11px;border-top:1px solid var(--brd);gap:10px;background:var(--s2);}
+
+.chart-foot{
+  display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;
+  padding:9px 20px 11px;border-top:1px solid var(--brd);gap:10px;background:var(--s2);
+}
 .chart-foot span{font-size:.62rem;color:var(--muted);font-family:'IBM Plex Mono',monospace}
 .chart-foot b{color:var(--text)}
-.err{background:var(--err-bg);border:1px solid var(--err-bd);border-radius:8px;padding:11px 16px;color:var(--err-cl);font-family:'IBM Plex Mono',monospace;font-size:.76rem;margin-bottom:14px}
-footer{text-align:center;padding:14px 0 6px;color:var(--muted);font-size:.62rem;font-family:'IBM Plex Mono',monospace;border-top:1px solid var(--brd);margin-top:4px}
 
-/* ══ PRICE / VWAP ══ */
-.pv-card{background:var(--s1);border:1px solid var(--brd);border-radius:8px;overflow:hidden;margin-bottom:18px;box-shadow:var(--shadow);transition:background .3s;}
-.pv-hd{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;padding:12px 18px;border-bottom:1px solid var(--brd);background:var(--s2);}
-.pv-title{font-size:.86rem;font-weight:700;letter-spacing:.04em;display:flex;align-items:center;gap:8px}
+.err{background:var(--err-bg);border:1px solid var(--err-bd);border-radius:8px;
+  padding:11px 16px;color:var(--err-cl);font-family:'IBM Plex Mono',monospace;
+  font-size:.76rem;margin-bottom:14px}
+footer{text-align:center;padding:14px 0 6px;color:var(--muted);
+  font-size:.62rem;font-family:'IBM Plex Mono',monospace;
+  border-top:1px solid var(--brd);margin-top:4px}
+/* ══════════════════════════════════════════════════════════
+   PRICE / VWAP CHART SECTION
+══════════════════════════════════════════════════════════ */
+.pv-card{
+  background:var(--s1);border:1px solid var(--brd);border-radius:8px;
+  overflow:hidden;margin-bottom:18px;box-shadow:var(--shadow);transition:background .3s;
+}
+/* header */
+.pv-hd{
+  display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;
+  gap:10px;padding:12px 18px;border-bottom:1px solid var(--brd);background:var(--s2);
+}
+.pv-title{font-size:.86rem;font-weight:700;letter-spacing:.04em;
+  display:flex;align-items:center;gap:8px}
 .pv-title svg{width:16px;height:16px;stroke:var(--gold);flex-shrink:0}
-.tf-btn{cursor:pointer;font-family:'IBM Plex Mono',monospace;font-size:.72rem;font-weight:600;padding:5px 14px;border-radius:6px;border:1px solid var(--brd);background:var(--s1);color:var(--muted);transition:all .18s;user-select:none;}
+/* timeframe buttons */
+.tf-btns{display:flex;align-items:center;gap:6px}
+.tf-btn{
+  cursor:pointer;font-family:'IBM Plex Mono',monospace;font-size:.72rem;font-weight:600;
+  padding:5px 14px;border-radius:6px;border:1px solid var(--brd);
+  background:var(--s1);color:var(--muted);transition:all .18s;user-select:none;
+}
 .tf-btn:hover{border-color:var(--gold);color:var(--text)}
-.tf-btn.active{background:rgba(251,191,36,.14);border-color:var(--gold);color:var(--gold);font-weight:700;box-shadow:0 0 0 2px rgba(251,191,36,.2);}
+.tf-btn.active{
+  background:rgba(251,191,36,.14);border-color:var(--gold);
+  color:var(--gold);font-weight:700;box-shadow:0 0 0 2px rgba(251,191,36,.2);
+}
 [data-theme="day"] .tf-btn.active{background:rgba(154,103,0,.1)}
-.pv-body{display:grid;grid-template-columns:1fr 120px 1fr;gap:0;background:var(--chart-bg);transition:background .3s;min-height:400px;align-items:stretch;}
-.pv-panel{padding:14px 14px 10px;display:flex;flex-direction:column;gap:8px;}
-.pv-panel-title{font-size:.72rem;font-weight:700;font-family:'IBM Plex Mono',monospace;display:flex;align-items:center;gap:6px;padding:0 2px;}
+/* 3-col body */
+.pv-body{
+  display:grid;
+  grid-template-columns:1fr 120px 1fr;
+  gap:0;
+  background:var(--chart-bg);transition:background .3s;
+  min-height:400px;
+  align-items:stretch;
+}
+/* individual chart panels */
+.pv-panel{
+  padding:14px 14px 10px;display:flex;flex-direction:column;gap:8px;
+}
+.pv-panel-title{
+  font-size:.72rem;font-weight:700;font-family:'IBM Plex Mono',monospace;
+  display:flex;align-items:center;gap:6px;padding:0 2px;
+}
 .pv-panel-ce .pv-panel-title{color:var(--ce)}
 .pv-panel-pe .pv-panel-title{color:var(--pe)}
 .pv-panel-ce{border-right:1px solid var(--brd)}
 .pv-panel-pe{border-left:1px solid var(--brd)}
 .pv-canvas-wrap{position:relative;flex:1;min-height:360px}
 .pv-canvas-wrap canvas{display:none;width:100%!important;height:360px!important}
-.pv-placeholder{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;color:var(--muted);font-family:'IBM Plex Mono',monospace;font-size:.7rem;text-align:center;}
+.pv-placeholder{
+  position:absolute;inset:0;display:flex;flex-direction:column;
+  align-items:center;justify-content:center;gap:10px;
+  color:var(--muted);font-family:'IBM Plex Mono',monospace;font-size:.7rem;text-align:center;
+}
 .pv-placeholder svg{opacity:.2;width:36px;height:36px;stroke:var(--muted)}
-.pv-spinner{position:absolute;inset:0;display:none;flex-direction:column;align-items:center;justify-content:center;gap:12px;background:var(--chart-bg);z-index:5;}
+.pv-spinner{
+  position:absolute;inset:0;display:none;flex-direction:column;
+  align-items:center;justify-content:center;gap:12px;
+  background:var(--chart-bg);z-index:5;
+}
 .pv-spinner.show{display:flex}
-.pv-strike-col{display:flex;flex-direction:column;align-items:stretch;border-left:1px solid var(--brd);border-right:1px solid var(--brd);background:var(--s2);padding:10px 6px;gap:4px;overflow-y:auto;align-self:stretch;}
-.pv-sk-lbl{font-size:.56rem;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);font-family:'IBM Plex Mono',monospace;margin-bottom:4px;text-align:center;}
-.pv-sk-btn{cursor:pointer;width:100%;font-family:'IBM Plex Mono',monospace;font-size:.65rem;font-weight:600;padding:7px 4px;border-radius:5px;border:1px solid var(--brd);background:var(--s1);color:var(--muted);transition:all .18s;user-select:none;text-align:center;white-space:normal;word-break:break-all;line-height:1.2;}
+/* vertical strike selector (centre column) */
+.pv-strike-col{
+  display:flex;flex-direction:column;align-items:stretch;
+  border-left:1px solid var(--brd);border-right:1px solid var(--brd);
+  background:var(--s2);padding:10px 6px;gap:4px;
+  overflow-y:auto;
+  align-self:stretch;
+}
+.pv-sk-lbl{
+  font-size:.56rem;text-transform:uppercase;letter-spacing:.08em;
+  color:var(--muted);font-family:'IBM Plex Mono',monospace;
+  margin-bottom:4px;text-align:center;
+}
+.pv-sk-btn{
+  cursor:pointer;width:100%;
+  font-family:'IBM Plex Mono',monospace;font-size:.65rem;font-weight:600;
+  padding:7px 4px;border-radius:5px;border:1px solid var(--brd);
+  background:var(--s1);color:var(--muted);
+  transition:all .18s;user-select:none;text-align:center;
+  white-space:normal;word-break:break-all;line-height:1.2;
+}
 .pv-sk-btn:hover{border-color:var(--ce);color:var(--text)}
-.pv-sk-btn.active{background:rgba(0,212,160,.12);border-color:var(--ce);color:var(--ce);font-weight:700;box-shadow:0 0 0 2px rgba(0,212,160,.15);}
-.pv-sk-btn.pv-sk-atm{background:rgba(251,191,36,.1);border-color:var(--gold);color:var(--gold);}
-.pv-sk-btn.pv-sk-atm.active{background:rgba(251,191,36,.2);box-shadow:0 0 0 2px rgba(251,191,36,.25);}
+.pv-sk-btn.active{
+  background:rgba(0,212,160,.12);border-color:var(--ce);
+  color:var(--ce);font-weight:700;box-shadow:0 0 0 2px rgba(0,212,160,.15);
+}
+.pv-sk-btn.pv-sk-atm{
+  background:rgba(251,191,36,.1);border-color:var(--gold);color:var(--gold);
+}
+.pv-sk-btn.pv-sk-atm.active{
+  background:rgba(251,191,36,.2);box-shadow:0 0 0 2px rgba(251,191,36,.25);
+}
 [data-theme="day"] .pv-sk-btn.active{background:rgba(0,122,92,.1)}
-.pv-mp{font-size:.6rem;font-family:'IBM Plex Mono',monospace;padding:2px 8px;border-radius:50px;border:1px solid var(--brd);background:var(--s1);color:var(--muted);display:flex;align-items:center;gap:4px;}
+/* chart meta mini-pills inside each panel */
+.pv-meta{display:flex;gap:8px;flex-wrap:wrap}
+.pv-mp{
+  font-size:.6rem;font-family:'IBM Plex Mono',monospace;
+  padding:2px 8px;border-radius:50px;border:1px solid var(--brd);
+  background:var(--s1);color:var(--muted);display:flex;align-items:center;gap:4px;
+}
 .pv-mp b{font-weight:700}
 .pv-mp-price-ce{color:var(--ce)!important;border-color:rgba(0,212,160,.3)!important;background:rgba(0,212,160,.06)!important}
 .pv-mp-vwap-ce {color:#a0e8ff!important;border-color:rgba(160,232,255,.3)!important;background:rgba(160,232,255,.05)!important}
 .pv-mp-price-pe{color:var(--pe)!important;border-color:rgba(255,63,108,.3)!important;background:rgba(255,63,108,.06)!important}
 .pv-mp-vwap-pe {color:#ffb3c8!important;border-color:rgba(255,179,200,.3)!important;background:rgba(255,179,200,.05)!important}
-.pv-foot{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;padding:8px 18px;border-top:1px solid var(--brd);gap:8px;background:var(--s2);}
+/* pv footer */
+.pv-foot{
+  display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;
+  padding:8px 18px;border-top:1px solid var(--brd);gap:8px;background:var(--s2);
+}
 .pv-foot span{font-size:.62rem;color:var(--muted);font-family:'IBM Plex Mono',monospace}
 .pv-foot b{color:var(--text)}
 </style>
@@ -1146,9 +1448,14 @@ footer{text-align:center;padding:14px 0 6px;color:var(--muted);font-size:.62rem;
   </div>
 </div>
 
-<!-- ── OI HISTORY CHART ── -->
+<!-- ══════════════════════════════════════════════════════════
+     OI HISTORY CHART  —  4-day (3 historical + today live)
+══════════════════════════════════════════════════════════ -->
 <div class="chart-card fade">
+
+  <!-- Header -->
   <div class="chart-hd">
+    <!-- Row 1: title + meta -->
     <div class="chart-hd-top">
       <div class="chart-title">
         <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
@@ -1162,6 +1469,7 @@ footer{text-align:center;padding:14px 0 6px;color:var(--muted);font-size:.62rem;
         <span class="src-badge" id="ch-src" style="display:none"></span>
       </div>
     </div>
+    <!-- Row 2: strike pill buttons -->
     <div class="chart-sel-row">
       <span class="chart-sel-lbl">Strike →</span>
       <div class="strike-btns" id="strike-btns">
@@ -1169,6 +1477,8 @@ footer{text-align:center;padding:14px 0 6px;color:var(--muted);font-size:.62rem;
       </div>
     </div>
   </div>
+
+  <!-- Day filter row -->
   <div class="day-filter-row">
     <span class="day-filter-lbl">Show:</span>
     <button class="day-btn" data-days="1" onclick="setDays(1)">1 Day</button>
@@ -1176,8 +1486,12 @@ footer{text-align:center;padding:14px 0 6px;color:var(--muted);font-size:.62rem;
     <button class="day-btn" data-days="3" onclick="setDays(3)">3 Days</button>
     <button class="day-btn active" data-days="4" onclick="setDays(4)">4 Days</button>
     <div class="day-btn-sep"></div>
-    <span style="font-size:.6rem;color:var(--muted);font-family:'IBM Plex Mono',monospace">Each day = market hours only (9:15 AM – 3:30 PM)</span>
+    <span style="font-size:.6rem;color:var(--muted);font-family:'IBM Plex Mono',monospace">
+      Each day = market hours only (9:15 AM – 3:30 PM)
+    </span>
   </div>
+
+  <!-- Canvas -->
   <div class="chart-body">
     <div class="chart-canvas-wrap">
       <div class="chart-spinner" id="chart-spinner">
@@ -1185,18 +1499,34 @@ footer{text-align:center;padding:14px 0 6px;color:var(--muted);font-size:.62rem;
         <div class="spinner-txt">Fetching 4-day OI history…</div>
       </div>
       <div class="chart-placeholder" id="chart-ph">
-        <svg viewBox="0 0 24 24" fill="none" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
-        <p>Waiting for first OI snapshot…<br><span style="font-size:.62rem">Select a strike above · chart updates every 3 min</span></p>
+        <svg viewBox="0 0 24 24" fill="none" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
+        </svg>
+        <p>Waiting for first OI snapshot…<br>
+           <span style="font-size:.62rem">Select a strike above · chart updates every 3 min</span></p>
       </div>
       <canvas id="oi-chart"></canvas>
     </div>
     <div class="chart-legend">
-      <div class="leg-item"><div class="leg-sw" style="background:var(--ce)"></div><span style="color:var(--ce);font-weight:700">CE OI</span><span>Call Open Interest</span></div>
-      <div class="leg-item"><div class="leg-sw" style="background:var(--pe)"></div><span style="color:var(--pe);font-weight:700">PE OI</span><span>Put Open Interest</span></div>
-      <div class="leg-item" style="font-size:.6rem"><span style="color:var(--muted)">Hover over chart to see values · Each point = 3-min snapshot</span></div>
-      <div class="leg-item" style="font-size:.6rem"><span style="color:#8b9eff">⚡ Switching strike or days preserves all collected history</span></div>
+      <div class="leg-item">
+        <div class="leg-sw" style="background:var(--ce)"></div>
+        <span style="color:var(--ce);font-weight:700">CE OI</span>
+        <span>Call Open Interest</span>
+      </div>
+      <div class="leg-item">
+        <div class="leg-sw" style="background:var(--pe)"></div>
+        <span style="color:var(--pe);font-weight:700">PE OI</span>
+        <span>Put Open Interest</span>
+      </div>
+      <div class="leg-item" style="font-size:.6rem">
+        <span style="color:var(--muted)">Hover over chart to see values · Each point = 3-min snapshot</span>
+      </div>
+      <div class="leg-item" style="font-size:.6rem">
+        <span style="color:#8b9eff">⚡ Switching strike or days preserves all collected history</span>
+      </div>
     </div>
   </div>
+
   <div class="chart-foot">
     <span>Strike: <b id="cf-strike">—</b></span>
     <span>From: <b id="cf-from">—</b></span>
@@ -1205,14 +1535,23 @@ footer{text-align:center;padding:14px 0 6px;color:var(--muted);font-size:.62rem;
   </div>
 </div>
 
-<!-- ── PRICE + VWAP CHARTS ── -->
+<!-- ══════════════════════════════════════════════════════════
+     PRICE + VWAP CHARTS  (CE left · Strike centre · PE right)
+══════════════════════════════════════════════════════════ -->
 <div class="pv-card fade">
+
+  <!-- Header -->
   <div class="pv-hd">
     <div class="pv-title">
-      <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 2 9 10 13 4 17 10 21 6"/><line x1="3" y1="20" x2="21" y2="20"/></svg>
-      Price &amp; VWAP <span style="color:var(--muted);font-size:.7rem;font-weight:400">CE on left · PE on right · today intraday</span>
+      <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="3 6 5 2 9 10 13 4 17 10 21 6"/>
+        <line x1="3" y1="20" x2="21" y2="20"/>
+      </svg>
+      Price &amp; VWAP
+      <span style="color:var(--muted);font-size:.7rem;font-weight:400">CE on left · PE on right · today intraday</span>
     </div>
     <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
+      <!-- timeframe buttons -->
       <div style="display:flex;align-items:center;gap:6px">
         <span style="font-size:.64rem;color:var(--muted);font-family:'IBM Plex Mono',monospace;margin-right:2px">TF:</span>
         <button class="tf-btn active" data-tf="1"  onclick="setPvTf(1)">1 min</button>
@@ -1220,6 +1559,7 @@ footer{text-align:center;padding:14px 0 6px;color:var(--muted);font-size:.62rem;
         <button class="tf-btn"        data-tf="5"  onclick="setPvTf(5)">5 min</button>
         <button class="tf-btn"        data-tf="10" onclick="setPvTf(10)">10 min</button>
       </div>
+      <!-- live meta -->
       <div style="display:flex;gap:8px;flex-wrap:wrap" id="pv-meta-wrap">
         <div class="pv-mp pv-mp-price-ce">CE LTP: <b id="pv-ce-ltp">—</b></div>
         <div class="pv-mp pv-mp-vwap-ce" >CE VWAP: <b id="pv-ce-vwap">—</b></div>
@@ -1228,34 +1568,58 @@ footer{text-align:center;padding:14px 0 6px;color:var(--muted);font-size:.62rem;
       </div>
     </div>
   </div>
+
+  <!-- 3-column body -->
   <div class="pv-body">
+
+    <!-- LEFT: CE chart -->
     <div class="pv-panel pv-panel-ce">
       <div class="pv-panel-title">
         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="22 7 13.5 15.5 8.5 10.5 2 17"/></svg>
         CE — Price &amp; VWAP
       </div>
       <div class="pv-canvas-wrap">
-        <div class="pv-spinner" id="pv-ce-spin"><div class="spinner-ring"></div><div class="spinner-txt">Loading CE data…</div></div>
-        <div class="pv-placeholder" id="pv-ce-ph"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.5" stroke-linecap="round"><polyline points="22 7 13.5 15.5 8.5 10.5 2 17"/></svg><p>Select a strike<br>to load CE price chart</p></div>
+        <div class="pv-spinner" id="pv-ce-spin">
+          <div class="spinner-ring"></div>
+          <div class="spinner-txt">Loading CE data…</div>
+        </div>
+        <div class="pv-placeholder" id="pv-ce-ph">
+          <svg viewBox="0 0 24 24" fill="none" stroke-width="1.5" stroke-linecap="round"><polyline points="22 7 13.5 15.5 8.5 10.5 2 17"/></svg>
+          <p>Select a strike<br>to load CE price chart</p>
+        </div>
         <canvas id="ce-chart"></canvas>
       </div>
     </div>
+
+    <!-- CENTRE: vertical strike selector -->
     <div class="pv-strike-col" id="pv-strike-col">
       <div class="pv-sk-lbl">Strike</div>
-      <div style="font-size:.6rem;color:var(--muted);font-family:'IBM Plex Mono',monospace;text-align:center">loading…</div>
+      <div style="font-size:.6rem;color:var(--muted);font-family:'IBM Plex Mono',monospace;text-align:center">
+        loading…
+      </div>
     </div>
+
+    <!-- RIGHT: PE chart -->
     <div class="pv-panel pv-panel-pe">
       <div class="pv-panel-title">
         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="22 7 13.5 15.5 8.5 10.5 2 17"/></svg>
         PE — Price &amp; VWAP
       </div>
       <div class="pv-canvas-wrap">
-        <div class="pv-spinner" id="pv-pe-spin"><div class="spinner-ring"></div><div class="spinner-txt">Loading PE data…</div></div>
-        <div class="pv-placeholder" id="pv-pe-ph"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.5" stroke-linecap="round"><polyline points="22 7 13.5 15.5 8.5 10.5 2 17"/></svg><p>Select a strike<br>to load PE price chart</p></div>
+        <div class="pv-spinner" id="pv-pe-spin">
+          <div class="spinner-ring"></div>
+          <div class="spinner-txt">Loading PE data…</div>
+        </div>
+        <div class="pv-placeholder" id="pv-pe-ph">
+          <svg viewBox="0 0 24 24" fill="none" stroke-width="1.5" stroke-linecap="round"><polyline points="22 7 13.5 15.5 8.5 10.5 2 17"/></svg>
+          <p>Select a strike<br>to load PE price chart</p>
+        </div>
         <canvas id="pe-chart"></canvas>
       </div>
     </div>
-  </div>
+
+  </div><!-- /pv-body -->
+
   <div class="pv-foot">
     <span>Strike: <b id="pv-foot-strike">—</b></span>
     <span>Timeframe: <b id="pv-foot-tf">—</b></span>
@@ -1265,9 +1629,12 @@ footer{text-align:center;padding:14px 0 6px;color:var(--muted);font-size:.62rem;
   </div>
 </div>
 
-<footer>NIFTY OI Dashboard &nbsp;·&nbsp; Kite Connect API &nbsp;·&nbsp; 11 Strikes (ATM±5) &nbsp;·&nbsp; 4-day OI history &nbsp;·&nbsp; NSE/NFO</footer>
-</div>
+<footer>NIFTY OI Dashboard &nbsp;·&nbsp; Kite Connect API &nbsp;·&nbsp; 11 Strikes (ATM±5) &nbsp;·&nbsp; 4-day OI history (3 historical + today live) &nbsp;·&nbsp; NSE/NFO</footer>
+</div><!-- /wrap -->
 
+<!-- ══════════════════════════════════════════════════════════
+     JAVASCRIPT
+══════════════════════════════════════════════════════════ -->
 <script>
 const OI_INT  = {{ oi_interval }};
 const LTP_INT = {{ ltp_interval }};
@@ -1275,12 +1642,18 @@ let oiCountdown = OI_INT;
 let cachedRows  = [];
 let prevLTP     = {};
 
+/* ──────────────────────────────────────────────────────────
+   PER-STRIKE HISTORY STORE
+   { strike_int: { ts:["DD-MMM HH:MM",...], ce:[...], pe:[...] } }
+   NEVER wiped on strike change — only appended to.
+────────────────────────────────────────────────────────── */
 const localHistory = {};
-let chartStrike   = null;
-let activeDays    = 4;
+let chartStrike   = null;   // int
+let activeDays    = 4;      // how many past days to display in chart (1–4)
 let oiChart       = null;
 let chartIsInit   = false;
 
+/* ── Theme ── */
 let isDayMode = false;
 function toggleTheme(){
   isDayMode = !isDayMode;
@@ -1301,6 +1674,7 @@ function toggleTheme(){
   }
 })();
 
+/* ── Formatters ── */
 const fmtN  = n => n == null ? '—' : Number(n).toLocaleString('en-IN');
 const fmtP  = n => n == null ? '—' : Number(n).toFixed(2);
 const fmtK  = n => {
@@ -1315,6 +1689,7 @@ const fmtKs = n => {
   return (n>0?'+':'')+fmtK(n)+(n>0?' ▲':n<0?' ▼':'');
 };
 
+/* ── PCR helpers ── */
 function pcrInfo(p){
   const pct=Math.min(100,Math.max(0,(p/2)*100));
   if(!p)    return ['—',           'var(--gold)',50];
@@ -1331,6 +1706,7 @@ function spcrPill(pcr){
   return `<span class="pcr-s ${cls}">${lbl}</span>`;
 }
 
+/* ── Ring ── */
 setInterval(()=>{
   oiCountdown=Math.max(0,oiCountdown-1);
   const C=2*Math.PI*16;
@@ -1338,6 +1714,7 @@ setInterval(()=>{
   document.getElementById('ring-lbl').textContent=oiCountdown+'s';
 },1000);
 
+/* ── Flash ── */
 function flash(id,nv,pv){
   const el=document.getElementById(id);
   if(!el||pv===undefined)return;
@@ -1345,6 +1722,7 @@ function flash(id,nv,pv){
   if(nv>pv) el.classList.add('flash-u'); else if(nv<pv) el.classList.add('flash-d');
 }
 
+/* OI diff cell — hoisted so it works reliably in all browsers */
 function diffCell(diff, pct, align){
   if(diff === null || diff === undefined){
     const f = align==='ce' ? 'float:right' : '';
@@ -1355,10 +1733,12 @@ function diffCell(diff, pct, align){
     ? '<span class="pct-pill pill-new">NEW OI</span>'
     : '<span class="pct-pill '+(pct>0?'pill-p':pct<0?'pill-n':'pill-z')+'">'
       + (pct>=0?'+':'')+Number(pct).toFixed(2)+'%</span>';
-  const ds = '<span class="'+dc+'" style="display:block;text-align:'+(align==='ce'?'right':'left')+'">'+fmtKs(diff)+'</span>';
+  const ds = '<span class="'+dc+'" style="display:block;text-align:'
+    +(align==='ce'?'right':'left')+'">'+fmtKs(diff)+'</span>';
   return align==='ce' ? ds+pctHtml : pctHtml+ds;
 }
 
+/* ── Build OI table row ── */
 function buildRow(r, mxCE, mxPE){
   const atm = r.is_atm;
   const bCE = mxCE ? Math.min(100,(r.ce_oi/mxCE)*100) : 0;
@@ -1367,77 +1747,186 @@ function buildRow(r, mxCE, mxPE){
   const atmbadge = atm ? '<span class="atm-badge">ATM</span>' : '';
   const offsetSpan = off ? '<span class="strike-offset">'+off+'</span>' : '';
   const sLbl = '<span class="strike-lbl" style="color:var(--gold)">'+r.strike+atmbadge+'</span>'+offsetSpan;
+
   return '<tr'+(atm?' class="atm-row"':'')+'>'+
     '<td class="td-ce" style="color:var(--muted)">'+fmtK(r.ce_oi_tot)+'</td>'+
-    '<td class="td-ce oi-cell"><div class="oi-bar oi-bar-ce" style="width:'+bCE+'%"></div><span class="oi-num" style="color:var(--ce)">'+fmtK(r.ce_oi)+'</span></td>'+
+    '<td class="td-ce oi-cell">'+
+      '<div class="oi-bar oi-bar-ce" style="width:'+bCE+'%"></div>'+
+      '<span class="oi-num" style="color:var(--ce)">'+fmtK(r.ce_oi)+'</span>'+
+    '</td>'+
     '<td class="td-ce" style="min-width:80px">'+diffCell(r.ce_oi_diff,r.ce_oi_pct,'ce')+'</td>'+
     '<td class="td-ce" style="min-width:70px"></td>'+
-    '<td class="td-ce" id="cetd'+r.strike+'"><span class="ltp-val ltp-ce" id="celtp'+r.strike+'">'+fmtP(r.ce_ltp)+'</span></td>'+
+    '<td class="td-ce" id="cetd'+r.strike+'">'+
+      '<span class="ltp-val ltp-ce" id="celtp'+r.strike+'">'+fmtP(r.ce_ltp)+'</span>'+
+    '</td>'+
     '<td class="td-mid" style="min-width:120px">'+sLbl+'</td>'+
     '<td class="td-mid pcr-cell">'+spcrPill(r.strike_pcr)+'</td>'+
-    '<td class="td-pe" id="petd'+r.strike+'"><span class="ltp-val ltp-pe" id="peltp'+r.strike+'">'+fmtP(r.pe_ltp)+'</span></td>'+
+    '<td class="td-pe" id="petd'+r.strike+'">'+
+      '<span class="ltp-val ltp-pe" id="peltp'+r.strike+'">'+fmtP(r.pe_ltp)+'</span>'+
+    '</td>'+
     '<td class="td-pe" style="min-width:70px"></td>'+
     '<td class="td-pe" style="min-width:80px">'+diffCell(r.pe_oi_diff,r.pe_oi_pct,'pe')+'</td>'+
-    '<td class="td-pe oi-cell"><div class="oi-bar oi-bar-pe" style="width:'+bPE+'%"></div><span class="oi-num" style="color:var(--pe)">'+fmtK(r.pe_oi)+'</span></td>'+
+    '<td class="td-pe oi-cell">'+
+      '<div class="oi-bar oi-bar-pe" style="width:'+bPE+'%"></div>'+
+      '<span class="oi-num" style="color:var(--pe)">'+fmtK(r.pe_oi)+'</span>'+
+    '</td>'+
     '<td class="td-pe" style="color:var(--muted)">'+fmtK(r.pe_oi_tot)+'</td>'+
   '</tr>';
 }
 
+/* ════════════════════════════════════════════════════════════
+   CHART ENGINE
+════════════════════════════════════════════════════════════ */
+
 function cssv(n){ return getComputedStyle(document.documentElement).getPropertyValue(n).trim(); }
+
 function hex2rgba(c, a){
   if(!c) return `rgba(0,0,0,${a})`;
-  if(c.startsWith('#')){const r=parseInt(c.slice(1,3),16),g=parseInt(c.slice(3,5),16),b=parseInt(c.slice(5,7),16);return `rgba(${r},${g},${b},${a})`;}
+  if(c.startsWith('#')){
+    const r=parseInt(c.slice(1,3),16),g=parseInt(c.slice(3,5),16),b=parseInt(c.slice(5,7),16);
+    return `rgba(${r},${g},${b},${a})`;
+  }
+  // css variable resolved to rgb(r,g,b)
   return c.replace('rgb(','rgba(').replace(')',`,${a})`);
 }
+
 function palette(){
-  return {ce:cssv('--ce'),pe:cssv('--pe'),grid:cssv('--gc'),tick:cssv('--muted'),tip:cssv('--tt'),tipbrd:cssv('--tt-brd'),ttitle:cssv('--tt-title'),tbody:cssv('--tt-body')};
+  return {
+    ce    : cssv('--ce'),     pe   : cssv('--pe'),
+    grid  : cssv('--gc'),     tick : cssv('--muted'),
+    tip   : cssv('--tt'),     tipbrd: cssv('--tt-brd'),
+    ttitle: cssv('--tt-title'), tbody: cssv('--tt-body'),
+  };
 }
 
 function initChart(){
   const p   = palette();
   const ctx = document.getElementById('oi-chart').getContext('2d');
+
+  /* ── Inline plugin: draws a thin vertical line at every day boundary ─── */
   const dayBoundaryPlugin = {
     id: 'dayBoundary',
     afterDraw(chart){
-      const labels = chart.data.labels || [];
+      const labels  = chart.data.labels || [];
       if(labels.length < 2) return;
-      const ctx2   = chart.ctx;
-      const xAxis  = chart.scales.x;
-      const yAxis  = chart.scales.y;
-      const top    = yAxis.top;
-      const bottom = yAxis.bottom;
+      const ctx2    = chart.ctx;
+      const xAxis   = chart.scales.x;
+      const yAxis   = chart.scales.y;
+      const top     = yAxis.top;
+      const bottom  = yAxis.bottom;
       const lineCol = isDayMode ? 'rgba(0,0,0,0.30)' : 'rgba(255,255,255,0.30)';
       const lblCol  = isDayMode ? 'rgba(0,0,0,0.55)' : 'rgba(255,255,255,0.55)';
+
       ctx2.save();
       ctx2.strokeStyle = lineCol;
       ctx2.lineWidth   = 1;
       ctx2.setLineDash([4, 3]);
+
       labels.forEach((lbl, i)=>{
         if(i === 0) return;
         const prevDate = labels[i-1].split(' ')[0];
         const thisDate = lbl.split(' ')[0];
         if(thisDate === prevDate) return;
+
         const xPx = xAxis.getPixelForValue(i);
-        ctx2.beginPath(); ctx2.moveTo(xPx, top); ctx2.lineTo(xPx, bottom); ctx2.stroke();
+
+        /* Draw the vertical dashed line */
+        ctx2.beginPath();
+        ctx2.moveTo(xPx, top);
+        ctx2.lineTo(xPx, bottom);
+        ctx2.stroke();
+
+        /* Draw date label just below the x-axis */
         ctx2.setLineDash([]);
-        ctx2.fillStyle = lblCol;
-        ctx2.font = "bold 10px 'IBM Plex Mono', monospace";
-        ctx2.textAlign = 'center';
+        ctx2.fillStyle  = lblCol;
+        ctx2.font       = "bold 10px 'IBM Plex Mono', monospace";
+        ctx2.textAlign  = 'center';
         ctx2.fillText(thisDate, xPx, bottom + 18);
         ctx2.setLineDash([4, 3]);
       });
+
       ctx2.restore();
     }
   };
+
   oiChart = new Chart(ctx,{
-    type:'line', plugins:[dayBoundaryPlugin],
-    data:{labels:[],datasets:[
-      {label:'CE OI',data:[],yAxisID:'y',borderColor:p.ce,borderWidth:2.5,pointRadius:0,pointHoverRadius:6,pointHoverBackgroundColor:p.ce,pointHoverBorderColor:'#fff',pointHoverBorderWidth:2,tension:0.35,fill:true,backgroundColor:hex2rgba(p.ce,0.09)},
-      {label:'PE OI',data:[],yAxisID:'y',borderColor:p.pe,borderWidth:2.5,pointRadius:0,pointHoverRadius:6,pointHoverBackgroundColor:p.pe,pointHoverBorderColor:'#fff',pointHoverBorderWidth:2,tension:0.35,fill:true,backgroundColor:hex2rgba(p.pe,0.07)},
-    ]},
-    options:{responsive:true,maintainAspectRatio:false,animation:{duration:400},layout:{padding:{bottom:24}},interaction:{mode:'index',intersect:false},
-      plugins:{legend:{display:false},tooltip:{backgroundColor:p.tip,borderColor:p.tipbrd,borderWidth:1,titleColor:p.ttitle,bodyColor:p.tbody,padding:14,titleFont:{family:"'IBM Plex Mono'",size:12,weight:'700'},bodyFont:{family:"'IBM Plex Mono'",size:11},filter:item=>item.dataset.label!=='_sep',callbacks:{title:items=>items[0].label,label:item=>'  '+item.dataset.label+': '+Number(item.raw).toLocaleString('en-IN')+' lots',afterBody:items=>{const ce=items.find(i=>i.dataset.label==='CE OI'||i.dataset.label==='Total CE OI')?.raw||0;const pe=items.find(i=>i.dataset.label==='PE OI'||i.dataset.label==='Total PE OI')?.raw||0;return ce?['  PCR: '+(pe/ce).toFixed(4)]:[];}}}},
-      scales:{x:{grid:{display:false},ticks:{color:p.tick,font:{family:"'IBM Plex Mono'",size:10},maxRotation:0,autoSkip:true,maxTicksLimit:20,callback(val,idx){const lbl=this.getLabelForValue(val);if(!lbl)return '';const time=lbl.split(' ')[1]||'';return idx%20===0?time:''}},border:{color:cssv('--brd'),display:true}},y:{grid:{display:false},ticks:{color:p.tick,font:{family:"'IBM Plex Mono'",size:11},callback:v=>{if(Math.abs(v)>=1e7)return (v/1e7).toFixed(1)+' Cr';if(Math.abs(v)>=1e5)return (v/1e5).toFixed(1)+' L';return Number(v).toLocaleString('en-IN');}},border:{color:cssv('--brd'),display:true}}}
+    type:'line',
+    plugins:[dayBoundaryPlugin],
+    data:{
+      labels:[],
+      datasets:[
+        {
+          label:'CE OI', data:[], yAxisID:'y',
+          borderColor:p.ce, borderWidth:2.5,
+          pointRadius:0, pointHoverRadius:6,
+          pointHoverBackgroundColor:p.ce, pointHoverBorderColor:'#fff', pointHoverBorderWidth:2,
+          tension:0.35, fill:true, backgroundColor:hex2rgba(p.ce,0.09),
+        },
+        {
+          label:'PE OI', data:[], yAxisID:'y',
+          borderColor:p.pe, borderWidth:2.5,
+          pointRadius:0, pointHoverRadius:6,
+          pointHoverBackgroundColor:p.pe, pointHoverBorderColor:'#fff', pointHoverBorderWidth:2,
+          tension:0.35, fill:true, backgroundColor:hex2rgba(p.pe,0.07),
+        },
+      ]
+    },
+    options:{
+      responsive:true, maintainAspectRatio:false, animation:{duration:400},
+      layout:{ padding:{ bottom: 24 } },   /* extra room for date labels below x-axis */
+      interaction:{mode:'index',intersect:false},
+      plugins:{
+        legend:{display:false},
+        tooltip:{
+          backgroundColor:p.tip, borderColor:p.tipbrd, borderWidth:1,
+          titleColor:p.ttitle, bodyColor:p.tbody,
+          padding:14,
+          titleFont:{family:"'IBM Plex Mono'",size:12,weight:'700'},
+          bodyFont:{family:"'IBM Plex Mono'",size:11},
+          filter: item => item.dataset.label !== '_sep',
+          callbacks:{
+            title :items=> items[0].label,
+            label :item =>'  '+item.dataset.label+': '+Number(item.raw).toLocaleString('en-IN')+' lots',
+            afterBody:items=>{
+              const ce=items.find(i=>i.dataset.label==='CE OI'||i.dataset.label==='Total CE OI')?.raw||0;
+              const pe=items.find(i=>i.dataset.label==='PE OI'||i.dataset.label==='Total PE OI')?.raw||0;
+              return ce?['  PCR: '+(pe/ce).toFixed(4)]:[];
+            }
+          }
+        }
+      },
+      scales:{
+        x:{
+          grid:{display:false},
+          ticks:{
+            color:p.tick,
+            font:{family:"'IBM Plex Mono'",size:10},
+            maxRotation:0,
+            autoSkip:true,
+            maxTicksLimit:20,
+            callback(val, idx){
+              /* Show only HH:MM ticks during the day — date labels drawn by plugin */
+              const lbl = this.getLabelForValue(val);
+              if(!lbl) return '';
+              const time = lbl.split(' ')[1] || '';
+              /* Show time every ~20 points to avoid crowding */
+              return idx % 20 === 0 ? time : '';
+            }
+          },
+          border:{color:cssv('--brd'), display:true},
+        },
+        y:{
+          grid:{display:false},
+          ticks:{color:p.tick,font:{family:"'IBM Plex Mono'",size:11},
+            callback:v=>{
+              if(Math.abs(v)>=1e7) return (v/1e7).toFixed(1)+' Cr';
+              if(Math.abs(v)>=1e5) return (v/1e5).toFixed(1)+' L';
+              return Number(v).toLocaleString('en-IN');
+            }
+          },
+          border:{color:cssv('--brd'), display:true},
+        }
+      }
     }
   });
   chartIsInit = true;
@@ -1448,15 +1937,21 @@ function rebuildChartColors(){
   if(!oiChart) return;
   const p=palette();
   const ds=oiChart.data.datasets;
-  ds[0].borderColor=p.ce;ds[0].pointHoverBackgroundColor=p.ce;ds[0].backgroundColor=hex2rgba(p.ce,0.09);
-  ds[1].borderColor=p.pe;ds[1].pointHoverBackgroundColor=p.pe;ds[1].backgroundColor=hex2rgba(p.pe,0.07);
+  ds[0].borderColor=p.ce; ds[0].pointHoverBackgroundColor=p.ce;
+  ds[0].backgroundColor=hex2rgba(p.ce,0.09);
+  ds[1].borderColor=p.pe; ds[1].pointHoverBackgroundColor=p.pe;
+  ds[1].backgroundColor=hex2rgba(p.pe,0.07);
   const o=oiChart.options;
-  o.plugins.tooltip.backgroundColor=p.tip;o.plugins.tooltip.borderColor=p.tipbrd;o.plugins.tooltip.titleColor=p.ttitle;o.plugins.tooltip.bodyColor=p.tbody;
-  o.scales.x.ticks.color=p.tick;o.scales.x.border.color=cssv('--brd');
-  o.scales.y.ticks.color=p.tick;o.scales.y.border.color=cssv('--brd');
-  oiChart.update('none');
+  o.plugins.tooltip.backgroundColor=p.tip;
+  o.plugins.tooltip.borderColor=p.tipbrd;
+  o.plugins.tooltip.titleColor=p.ttitle;
+  o.plugins.tooltip.bodyColor=p.tbody;
+  o.scales.x.ticks.color=p.tick; o.scales.x.border.color=cssv('--brd');
+  o.scales.y.ticks.color=p.tick; o.scales.y.border.color=cssv('--brd');
+  oiChart.update('none');   /* plugin redraws day lines automatically on next render */
 }
 
+/* Render chart for a strike (or 'TOTAL' or 'OTM'), filtered to activeDays of data */
 function renderChart(strike){
   const isTotal = (strike === 'TOTAL');
   const isOtm   = (strike === 'OTM');
@@ -1464,287 +1959,621 @@ function renderChart(strike){
   const ph      = document.getElementById('chart-ph');
   const cv      = document.getElementById('oi-chart');
   const spin    = document.getElementById('chart-spinner');
+
   spin.classList.remove('show');
-  if(!hist || hist.ts.length === 0){ph.style.display='flex';cv.style.display='none';updateChartMeta(strike,null,null,0,isTotal);return;}
+
+  if(!hist || hist.ts.length === 0){
+    ph.style.display='flex'; cv.style.display='none';
+    updateChartMeta(strike, null, null, 0, isTotal);
+    return;
+  }
+
+  /* ── Filter to activeDays ── */
   const uniqueDates = [...new Set(hist.ts.map(t=>t.split(' ')[0]))].sort();
   const keepDates   = new Set(uniqueDates.slice(-activeDays));
-  const idxs        = hist.ts.reduce((a,t,i)=>{if(keepDates.has(t.split(' ')[0]))a.push(i);return a;},[]);
+  const idxs        = hist.ts.reduce((a,t,i)=>{ if(keepDates.has(t.split(' ')[0])) a.push(i); return a; },[]);
   const labels      = idxs.map(i=>hist.ts[i]);
   const ceData      = idxs.map(i=>hist.ce[i]);
   const peData      = idxs.map(i=>hist.pe[i]);
-  ph.style.display='none'; cv.style.display='block'; cv.style.height='420px';
-  if(!chartIsInit) initChart();
-  oiChart.data.datasets[0].label = isTotal?'Total CE OI':(strike==='OTM'?'OTM CE OI':'CE OI');
-  oiChart.data.datasets[1].label = isTotal?'Total PE OI':(strike==='OTM'?'OTM PE OI':'PE OI');
-  oiChart.data.labels=labels; oiChart.data.datasets[0].data=ceData; oiChart.data.datasets[1].data=peData;
+
+  ph.style.display='none';
+  cv.style.display='block';
+  cv.style.height = '420px';
+  if(!chartIsInit) initChart(labels);  // pass labels so plugin can compute boundaries on first init
+
+  /* Dataset labels for CE/PE */
+  oiChart.data.datasets[0].label = isTotal ? 'Total CE OI' : (strike==='OTM' ? 'OTM CE OI' : 'CE OI');
+  oiChart.data.datasets[1].label = isTotal ? 'Total PE OI' : (strike==='OTM' ? 'OTM PE OI' : 'PE OI');
+
+  oiChart.data.labels           = labels;
+  oiChart.data.datasets[0].data = ceData;
+  oiChart.data.datasets[1].data = peData;
   oiChart.update();
-  const n=labels.length-1;
-  updateChartMeta(strike,ceData[n],peData[n],labels.length,isTotal);
-  document.getElementById('cf-strike').textContent=isTotal?'All Strikes (Total)':(isOtm?'OTM Strikes (±1 to ±5)':strike);
-  document.getElementById('cf-from').textContent=labels[0]||'—';
-  document.getElementById('cf-to').textContent=labels[n]||'—';
-  document.getElementById('cf-pts').textContent=labels.length;
-  document.querySelectorAll('.day-btn').forEach(b=>b.classList.toggle('active',parseInt(b.dataset.days)===activeDays));
+
+  const n = labels.length - 1;
+  updateChartMeta(strike, ceData[n], peData[n], labels.length, isTotal);
+
+  document.getElementById('cf-strike').textContent = isTotal ? 'All Strikes (Total)' : (isOtm ? 'OTM Strikes (±1 to ±5)' : strike);
+  document.getElementById('cf-from').textContent   = labels[0] || '—';
+  document.getElementById('cf-to').textContent     = labels[n] || '—';
+  document.getElementById('cf-pts').textContent    = labels.length;
+
+  document.querySelectorAll('.day-btn').forEach(b=>{
+    b.classList.toggle('active', parseInt(b.dataset.days)===activeDays);
+  });
 }
 
 function updateChartMeta(strike, ce, pe, pts, isTotal){
-  const isOtm=(strike==='OTM');
-  const ceLabel=isTotal?'Total CE:':(isOtm?'OTM CE:':'CE OI:');
-  const peLabel=isTotal?'Total PE:':(isOtm?'OTM PE:':'PE OI:');
-  const ceEl=document.querySelector('.cmeta.cm-ce');
-  const peEl=document.querySelector('.cmeta.cm-pe');
-  if(ceEl) ceEl.innerHTML=ceLabel+' <b id="ch-ce">'+(ce!=null?fmtK(ce):'—')+'</b>';
-  if(peEl) peEl.innerHTML=peLabel+' <b id="ch-pe">'+(pe!=null?fmtK(pe):'—')+'</b>';
-  const pcrEl=document.getElementById('ch-pcr'); if(pcrEl) pcrEl.textContent=(ce&&pe)?(pe/ce).toFixed(4):'—';
-  const ptsEl=document.getElementById('ch-pts'); if(ptsEl) ptsEl.textContent=pts||0;
+  const isOtm   = (strike === 'OTM');
+  const ceLabel = isTotal ? 'Total CE:' : (isOtm ? 'OTM CE:' : 'CE OI:');
+  const peLabel = isTotal ? 'Total PE:' : (isOtm ? 'OTM PE:' : 'PE OI:');
+  /* Update the label text inside the pill */
+  const ceEl = document.querySelector('.cmeta.cm-ce');
+  const peEl = document.querySelector('.cmeta.cm-pe');
+  if(ceEl) ceEl.innerHTML = ceLabel + ' <b id="ch-ce">' + (ce!=null?fmtK(ce):'—') + '</b>';
+  if(peEl) peEl.innerHTML = peLabel + ' <b id="ch-pe">' + (pe!=null?fmtK(pe):'—') + '</b>';
+  const pcrEl = document.getElementById('ch-pcr');
+  if(pcrEl) pcrEl.textContent = (ce&&pe)?(pe/ce).toFixed(4):'—';
+  const ptsEl = document.getElementById('ch-pts');
+  if(ptsEl) ptsEl.textContent = pts||0;
 }
 
+/* Merge backend data into localHistory (de-dupe on timestamp) */
 function mergeIntoLocal(strike, ts_arr, ce_arr, pe_arr){
   if(!localHistory[strike]) localHistory[strike]={ts:[],ce:[],pe:[]};
-  const combined={};
-  localHistory[strike].ts.forEach((t,i)=>{combined[t]={ce:localHistory[strike].ce[i],pe:localHistory[strike].pe[i]};});
-  ts_arr.forEach((t,i)=>{combined[t]={ce:ce_arr[i],pe:pe_arr[i]};});
+  const existing = new Set(localHistory[strike].ts);
+  const combined = {};
+  // put existing first
+  localHistory[strike].ts.forEach((t,i)=>{ combined[t]={ce:localHistory[strike].ce[i],pe:localHistory[strike].pe[i]}; });
+  // overlay server data
+  ts_arr.forEach((t,i)=>{ combined[t]={ce:ce_arr[i],pe:pe_arr[i]}; });
   const sorted=Object.keys(combined).sort();
-  localHistory[strike]={ts:sorted,ce:sorted.map(t=>combined[t].ce),pe:sorted.map(t=>combined[t].pe)};
+  localHistory[strike]={ts:sorted, ce:sorted.map(t=>combined[t].ce), pe:sorted.map(t=>combined[t].pe)};
 }
 
+/* Append a single new live point to localHistory for all rows + TOTAL + OTM */
 function appendLivePoint(rows, tsNow){
-  let sumCe=0,sumPe=0,otmCe=0,otmPe=0;
+  let sumCe = 0, sumPe = 0;
+  let otmCe = 0, otmPe = 0;   // OTM only: CE side (offset>0) + PE side (offset<0)
+
   for(const r of rows){
     const sk=parseInt(r.strike);
     if(!localHistory[sk]) localHistory[sk]={ts:[],ce:[],pe:[]};
     const last=localHistory[sk].ts.slice(-1)[0];
-    if(last!==tsNow){localHistory[sk].ts.push(tsNow);localHistory[sk].ce.push(r.ce_oi);localHistory[sk].pe.push(r.pe_oi);}
-    sumCe+=(r.ce_oi||0); sumPe+=(r.pe_oi||0);
-    if(r.offset>0) otmCe+=(r.ce_oi||0);
-    if(r.offset<0) otmPe+=(r.pe_oi||0);
+    if(last!==tsNow){
+      localHistory[sk].ts.push(tsNow);
+      localHistory[sk].ce.push(r.ce_oi);
+      localHistory[sk].pe.push(r.pe_oi);
+    }
+    sumCe += (r.ce_oi || 0);
+    sumPe += (r.pe_oi || 0);
+
+    /* OTM = non-ATM strikes only
+       CE side (offset>0): add CE OI (these are OTM calls)
+       PE side (offset<0): add PE OI (these are OTM puts)
+       ATM (offset=0): excluded */
+    if(r.offset > 0) otmCe += (r.ce_oi || 0);
+    if(r.offset < 0) otmPe += (r.pe_oi || 0);
   }
-  if(!localHistory['TOTAL']) localHistory['TOTAL']={ts:[],ce:[],pe:[]};
-  const lastTotal=localHistory['TOTAL'].ts.slice(-1)[0];
-  if(lastTotal!==tsNow){localHistory['TOTAL'].ts.push(tsNow);localHistory['TOTAL'].ce.push(sumCe);localHistory['TOTAL'].pe.push(sumPe);}
-  else{const n=localHistory['TOTAL'].ts.length-1;localHistory['TOTAL'].ce[n]=sumCe;localHistory['TOTAL'].pe[n]=sumPe;}
-  if(!localHistory['OTM']) localHistory['OTM']={ts:[],ce:[],pe:[]};
-  const lastOtm=localHistory['OTM'].ts.slice(-1)[0];
-  if(lastOtm!==tsNow){localHistory['OTM'].ts.push(tsNow);localHistory['OTM'].ce.push(otmCe);localHistory['OTM'].pe.push(otmPe);}
-  else{const n=localHistory['OTM'].ts.length-1;localHistory['OTM'].ce[n]=otmCe;localHistory['OTM'].pe[n]=otmPe;}
+
+  /* TOTAL history */
+  if(!localHistory['TOTAL']) localHistory['TOTAL'] = {ts:[],ce:[],pe:[]};
+  const lastTotal = localHistory['TOTAL'].ts.slice(-1)[0];
+  if(lastTotal !== tsNow){
+    localHistory['TOTAL'].ts.push(tsNow);
+    localHistory['TOTAL'].ce.push(sumCe);
+    localHistory['TOTAL'].pe.push(sumPe);
+  } else {
+    const n = localHistory['TOTAL'].ts.length - 1;
+    localHistory['TOTAL'].ce[n] = sumCe;
+    localHistory['TOTAL'].pe[n] = sumPe;
+  }
+
+  /* OTM history */
+  if(!localHistory['OTM']) localHistory['OTM'] = {ts:[],ce:[],pe:[]};
+  const lastOtm = localHistory['OTM'].ts.slice(-1)[0];
+  if(lastOtm !== tsNow){
+    localHistory['OTM'].ts.push(tsNow);
+    localHistory['OTM'].ce.push(otmCe);
+    localHistory['OTM'].pe.push(otmPe);
+  } else {
+    const n = localHistory['OTM'].ts.length - 1;
+    localHistory['OTM'].ce[n] = otmCe;
+    localHistory['OTM'].pe[n] = otmPe;
+  }
 }
 
+/* Fetch 4-day historical OI from backend and merge into localHistory */
+/* Fetch historical OI for a single strike, TOTAL, or OTM */
 async function loadHistoricalOI(strike){
-  if(strike==='TOTAL'){await loadHistoricalTotal();return;}
-  if(strike==='OTM')  {await loadHistoricalOtm();  return;}
+  if(strike === 'TOTAL'){ await loadHistoricalTotal(); return; }
+  if(strike === 'OTM')  { await loadHistoricalOtm();   return; }
   document.getElementById('chart-spinner').classList.add('show');
   document.getElementById('chart-ph').style.display='none';
   document.getElementById('oi-chart').style.display='none';
   try{
-    const res=await fetch('/api/historical_oi?strike='+strike);
-    const data=await res.json();
-    if(data.ts && data.ts.length>0){
-      mergeIntoLocal(strike,data.ts,data.ce,data.pe);
+    const res  = await fetch('/api/historical_oi?strike='+strike);
+    const data = await res.json();
+    if(data.ts && data.ts.length > 0){
+      mergeIntoLocal(strike, data.ts, data.ce, data.pe);
       const sb=document.getElementById('ch-src');
-      if(data.source){sb.textContent=data.source==='historical+live'?'4-Day Data':'Live Only';sb.className='src-badge '+(data.source==='historical+live'?'src-hist':'src-live');sb.style.display='inline-block';}
+      if(data.source){
+        sb.textContent=data.source==='historical+live'?'4-Day Data':'Live Only';
+        sb.className='src-badge '+(data.source==='historical+live'?'src-hist':'src-live');
+        sb.style.display='inline-block';
+      }
     }
-  }catch(e){console.warn('Historical OI fetch failed:',e);}
+  } catch(e){
+    console.warn('Historical OI fetch failed:',e);
+  }
   renderChart(strike);
 }
 
+/* Fetch historical TOTAL OI (all 11 strikes summed) from backend */
 async function loadHistoricalTotal(){
   document.getElementById('chart-spinner').classList.add('show');
   document.getElementById('chart-ph').style.display='none';
   document.getElementById('oi-chart').style.display='none';
   try{
-    const res=await fetch('/api/historical_oi_total');
-    const data=await res.json();
-    if(data.ts && data.ts.length>0){
-      const combined={};
-      const existing=localHistory['TOTAL']||{ts:[],ce:[],pe:[]};
-      existing.ts.forEach((t,i)=>{combined[t]={ce:existing.ce[i],pe:existing.pe[i]};});
-      data.ts.forEach((t,i)=>{combined[t]={ce:data.ce[i],pe:data.pe[i]};});
-      const sorted=Object.keys(combined).sort();
-      localHistory['TOTAL']={ts:sorted,ce:sorted.map(t=>combined[t].ce),pe:sorted.map(t=>combined[t].pe)};
-      const sb=document.getElementById('ch-src');
-      if(data.source){sb.textContent=data.source==='historical+live'?'4-Day Total':'Live Total';sb.className='src-badge '+(data.source==='historical+live'?'src-hist':'src-live');sb.style.display='inline-block';}
+    const res  = await fetch('/api/historical_oi_total');
+    const data = await res.json();
+    console.log('[TOTAL] Response: source='+data.source+' pts='+( data.ts ? data.ts.length : 0 )+( data.error ? ' err='+data.error : '' ));
+    if(data.error && !data.ts){
+      console.warn('[TOTAL] Backend error:', data.error);
     }
-  }catch(e){console.warn('[TOTAL] fetch failed:',e);}
+    if(data.ts && data.ts.length > 0){
+      /* Backend already merged historical + today's live server-side.
+         Overlay on top of whatever live points we accumulated in JS. */
+      const combined = {};
+      /* Put existing JS-side live data in first (lowest priority) */
+      const existing = localHistory['TOTAL'] || {ts:[],ce:[],pe:[]};
+      existing.ts.forEach((t,i)=>{ combined[t]={ce:existing.ce[i],pe:existing.pe[i]}; });
+      /* Backend data wins (it has full 4-day history) */
+      data.ts.forEach((t,i)=>{ combined[t]={ce:data.ce[i],pe:data.pe[i]}; });
+      const sorted = Object.keys(combined).sort();
+      localHistory['TOTAL'] = {
+        ts: sorted,
+        ce: sorted.map(t=>combined[t].ce),
+        pe: sorted.map(t=>combined[t].pe),
+      };
+      const sb=document.getElementById('ch-src');
+      if(data.source){
+        sb.textContent=data.source==='historical+live'?'4-Day Total':'Live Total';
+        sb.className='src-badge '+(data.source==='historical+live'?'src-hist':'src-live');
+        sb.style.display='inline-block';
+      }
+    }
+  } catch(e){
+    console.warn('[TOTAL] loadHistoricalTotal fetch failed:',e);
+  }
   renderChart('TOTAL');
 }
 
+/* Fetch historical OTM OI from backend */
 async function loadHistoricalOtm(){
   document.getElementById('chart-spinner').classList.add('show');
   document.getElementById('chart-ph').style.display='none';
   document.getElementById('oi-chart').style.display='none';
   try{
-    const res=await fetch('/api/historical_oi_otm');
-    const data=await res.json();
-    if(data.ts && data.ts.length>0){
-      const combined={};
-      const existing=localHistory['OTM']||{ts:[],ce:[],pe:[]};
-      existing.ts.forEach((t,i)=>{combined[t]={ce:existing.ce[i],pe:existing.pe[i]};});
-      data.ts.forEach((t,i)=>{combined[t]={ce:data.ce[i],pe:data.pe[i]};});
-      const sorted=Object.keys(combined).sort();
-      localHistory['OTM']={ts:sorted,ce:sorted.map(t=>combined[t].ce),pe:sorted.map(t=>combined[t].pe)};
+    const res  = await fetch('/api/historical_oi_otm');
+    const data = await res.json();
+    console.log('[OTM] Response: source='+data.source+' pts='+(data.ts?data.ts.length:0)+(data.error?' err='+data.error:''));
+    if(data.ts && data.ts.length > 0){
+      const combined = {};
+      const existing = localHistory['OTM'] || {ts:[],ce:[],pe:[]};
+      existing.ts.forEach((t,i)=>{ combined[t]={ce:existing.ce[i],pe:existing.pe[i]}; });
+      data.ts.forEach((t,i)=>{ combined[t]={ce:data.ce[i],pe:data.pe[i]}; });
+      const sorted = Object.keys(combined).sort();
+      localHistory['OTM'] = {
+        ts: sorted,
+        ce: sorted.map(t=>combined[t].ce),
+        pe: sorted.map(t=>combined[t].pe),
+      };
       const sb=document.getElementById('ch-src');
-      if(data.source){sb.textContent=data.source==='historical+live'?'4-Day OTM':'Live OTM';sb.className='src-badge '+(data.source==='historical+live'?'src-hist':'src-live');sb.style.display='inline-block';}
+      if(data.source){
+        sb.textContent=data.source==='historical+live'?'4-Day OTM':'Live OTM';
+        sb.className='src-badge '+(data.source==='historical+live'?'src-hist':'src-live');
+        sb.style.display='inline-block';
+      }
     }
-  }catch(e){console.warn('[OTM] fetch failed:',e);}
+  } catch(e){
+    console.warn('[OTM] loadHistoricalOtm fetch failed:',e);
+  }
   renderChart('OTM');
 }
+function setDays(n){
+  activeDays = n;
+  if(chartStrike !== null) renderChart(chartStrike);
+}
 
-function setDays(n){ activeDays=n; if(chartStrike!==null) renderChart(chartStrike); }
-
+/* ── Strike pill buttons ── */
 let strikeBtnATM = null;
+
 function buildStrikeButtons(rows, atm){
-  const wrap=document.getElementById('strike-btns');
-  const curSk=chartStrike?String(chartStrike):null;
-  const newKeys='TOTAL,OTM,'+rows.map(r=>r.strike).join(',');
-  if(wrap.dataset.keys===newKeys) return;
-  wrap.dataset.keys=newKeys; wrap.innerHTML=''; strikeBtnATM=null;
-  const totalBtn=document.createElement('button');
-  totalBtn.textContent='Total OI';totalBtn.className='sk-btn sk-total'+(curSk==='TOTAL'?' active':'');totalBtn.dataset.strike='TOTAL';totalBtn.onclick=()=>selectStrike('TOTAL',totalBtn);wrap.appendChild(totalBtn);
-  const otmBtn=document.createElement('button');
-  otmBtn.textContent='OTM OI';otmBtn.className='sk-btn sk-otm'+(curSk==='OTM'?' active':'');otmBtn.dataset.strike='OTM';otmBtn.title='OTM Only: ATM+1..+5 CE  +  ATM-1..-5 PE  (excludes ATM)';otmBtn.onclick=()=>selectStrike('OTM',otmBtn);wrap.appendChild(otmBtn);
-  const sep=document.createElement('span');sep.style.cssText='width:1px;height:20px;background:var(--brd);flex-shrink:0;margin:0 2px';wrap.appendChild(sep);
+  const wrap   = document.getElementById('strike-btns');
+  const curSk  = chartStrike ? String(chartStrike) : null;
+
+  /* Only rebuild if strikes actually changed */
+  const newKeys = 'TOTAL,OTM,' + rows.map(r=>r.strike).join(',');
+  if(wrap.dataset.keys === newKeys) return;
+  wrap.dataset.keys = newKeys;
+
+  wrap.innerHTML = '';
+  strikeBtnATM   = null;
+
+  /* ── TOTAL button (always first) ── */
+  const totalBtn = document.createElement('button');
+  totalBtn.textContent  = 'Total OI';
+  totalBtn.className    = 'sk-btn sk-total' + (curSk === 'TOTAL' ? ' active' : '');
+  totalBtn.dataset.strike = 'TOTAL';
+  totalBtn.onclick      = () => selectStrike('TOTAL', totalBtn);
+  wrap.appendChild(totalBtn);
+
+  /* ── OTM button (OTM calls CE + OTM puts PE, no ATM) ── */
+  const otmBtn = document.createElement('button');
+  otmBtn.textContent  = 'OTM OI';
+  otmBtn.className    = 'sk-btn sk-otm' + (curSk === 'OTM' ? ' active' : '');
+  otmBtn.dataset.strike = 'OTM';
+  otmBtn.title        = 'OTM Only: ATM+1..+5 CE  +  ATM-1..-5 PE  (excludes ATM)';
+  otmBtn.onclick      = () => selectStrike('OTM', otmBtn);
+  wrap.appendChild(otmBtn);
+
+  /* ── Separator ── */
+  const sep = document.createElement('span');
+  sep.style.cssText = 'width:1px;height:20px;background:var(--brd);flex-shrink:0;margin:0 2px';
+  wrap.appendChild(sep);
+
+  /* ── Per-strike buttons ── */
   rows.forEach(r=>{
-    const btn=document.createElement('button');
-    const off=r.strike-atm; const isAtm=off===0; const isCE=off>0;
-    const label=isAtm?r.strike+' ATM':isCE?'+'+off+' ('+r.strike+')':off+' ('+r.strike+')';
-    btn.textContent=label;
-    btn.className='sk-btn'+(isAtm?' sk-atm':isCE?' sk-ce':' sk-pe')+(String(r.strike)===curSk?' active':'');
-    btn.dataset.strike=r.strike; btn.onclick=()=>selectStrike(r.strike,btn); wrap.appendChild(btn);
-    if(isAtm) strikeBtnATM=btn;
+    const btn   = document.createElement('button');
+    const off   = r.strike - atm;
+    const isAtm = off === 0;
+    const isCE  = off > 0;
+    const label = isAtm ? r.strike + ' ATM' :
+                  isCE  ? '+' + off + ' (' + r.strike + ')' :
+                           off  + ' (' + r.strike + ')';
+    btn.textContent   = label;
+    btn.className     = 'sk-btn' +
+      (isAtm ? ' sk-atm' : isCE ? ' sk-ce' : ' sk-pe') +
+      (String(r.strike) === curSk ? ' active' : '');
+    btn.dataset.strike = r.strike;
+    btn.onclick = () => selectStrike(r.strike, btn);
+    wrap.appendChild(btn);
+    if(isAtm) strikeBtnATM = btn;
   });
-  if(chartStrike===null && strikeBtnATM) selectStrike(atm,strikeBtnATM);
+
+  /* Auto-select ATM on very first load */
+  if(chartStrike === null && strikeBtnATM){
+    selectStrike(atm, strikeBtnATM);
+  }
 }
 
 function selectStrike(strike, btnEl){
   document.querySelectorAll('.sk-btn').forEach(b=>b.classList.remove('active'));
   if(btnEl) btnEl.classList.add('active');
-  if(strike==='TOTAL'){chartStrike='TOTAL';if(localHistory['TOTAL']&&localHistory['TOTAL'].ts.length>0)renderChart('TOTAL');loadHistoricalTotal();return;}
-  if(strike==='OTM')  {chartStrike='OTM';  if(localHistory['OTM']  &&localHistory['OTM'].ts.length>0)  renderChart('OTM');  loadHistoricalOtm();  return;}
-  chartStrike=parseInt(strike);
-  if(localHistory[chartStrike]&&localHistory[chartStrike].ts.length>0) renderChart(chartStrike);
+
+  if(strike === 'TOTAL'){
+    chartStrike = 'TOTAL';
+    if(localHistory['TOTAL'] && localHistory['TOTAL'].ts.length > 0) renderChart('TOTAL');
+    loadHistoricalTotal();
+    return;
+  }
+
+  if(strike === 'OTM'){
+    chartStrike = 'OTM';
+    if(localHistory['OTM'] && localHistory['OTM'].ts.length > 0) renderChart('OTM');
+    loadHistoricalOtm();
+    return;
+  }
+
+  chartStrike = parseInt(strike);
+  if(localHistory[chartStrike] && localHistory[chartStrike].ts.length > 0) renderChart(chartStrike);
   loadHistoricalOI(chartStrike);
 }
 
+/* ════════════════════════════════════════════════════════════
+   OI FETCH  (every 3 min)
+════════════════════════════════════════════════════════════ */
 async function fetchOI(){
   try{
-    const res=await fetch('/api/oi'); const j=await res.json();
-    if(j.error){document.getElementById('err-box').style.display='block';document.getElementById('err-box').textContent='OI Error: '+j.error;return;}
-    document.getElementById('err-box').style.display='none';
-    const d=j.data; if(!d||!d.atm) return;
-    document.getElementById('chip-time').textContent=j.updated_at||'—';
-    document.getElementById('chip-exp').textContent=d.expiry||'—';
-    oiCountdown=OI_INT;
-    document.getElementById('cv-atm').textContent=fmtN(d.atm);
-    document.getElementById('cv-tce').textContent=fmtK(d.total_ce);
-    document.getElementById('cv-tpe').textContent=fmtK(d.total_pe);
-    document.getElementById('cv-exp').textContent=d.expiry||'—';
-    const pcr=d.pcr||0; const [sent,col,pct]=pcrInfo(pcr);
-    const pcrEl1=document.getElementById('cv-pcr');
-    const pcrEl2=document.getElementById('pcr-big');
-    if(pcrEl1){pcrEl1.textContent=pcr.toFixed(4);pcrEl1.style.color=col;}
-    if(pcrEl2){pcrEl2.textContent=pcr.toFixed(4);pcrEl2.style.color=col;}
-    document.getElementById('cv-pcr-s').textContent=sent;
-    document.getElementById('pcr-fill').style.width=pct+'%';
-    document.getElementById('pcr-fill').style.background=col;
-    document.getElementById('pcr-sent').textContent=sent; document.getElementById('pcr-sent').style.color=col;
-    cachedRows=d.rows||[];
-    const mxCE=Math.max(...cachedRows.map(r=>r.ce_oi||0),1);
-    const mxPE=Math.max(...cachedRows.map(r=>r.pe_oi||0),1);
-    document.getElementById('oi-tbody').innerHTML=cachedRows.map(r=>buildRow(r,mxCE,mxPE)).join('');
-    document.getElementById('foot-tce').textContent='Total CE: '+fmtK(d.total_ce);
-    document.getElementById('foot-tpe').textContent='Total PE: '+fmtK(d.total_pe);
-    const fp=document.getElementById('foot-pcr'); if(fp){fp.textContent='PCR: '+pcr.toFixed(4);fp.style.color=col;}
-    const tsNow=d.ts_chart||(new Date().toLocaleDateString('en-IN',{day:'2-digit',month:'short'}).replace(' ','-')+' '+new Date().toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit',hour12:false}));
-    appendLivePoint(cachedRows,tsNow);
-    buildStrikeButtons(cachedRows,d.atm);
-    buildPvStrikeCol(cachedRows,d.atm);
-    if(chartStrike!==null){
-      if(chartStrike==='TOTAL') renderChart('TOTAL');
-      else if(chartStrike==='OTM') renderChart('OTM');
-      else if(localHistory[chartStrike]) renderChart(chartStrike);
+    const res = await fetch('/api/oi');
+    const j   = await res.json();
+
+    if(j.error){
+      document.getElementById('err-box').style.display='block';
+      document.getElementById('err-box').textContent='OI Error: '+j.error;
+      return;
     }
-  }catch(e){
-    console.error('[OI] fetchOI error:',e);
+    document.getElementById('err-box').style.display='none';
+
+    const d = j.data;
+    if(!d || !d.atm) return;   // empty payload guard
+
+    console.log('[OI] Received data, ATM='+d.atm+' spot='+d.spot);
+
+    document.getElementById('chip-time').textContent = j.updated_at || '—';
+    document.getElementById('chip-exp').textContent  = d.expiry     || '—';
+    oiCountdown = OI_INT;
+
+    document.getElementById('cv-atm').textContent = fmtN(d.atm);
+    document.getElementById('cv-tce').textContent = fmtK(d.total_ce);
+    document.getElementById('cv-tpe').textContent = fmtK(d.total_pe);
+    document.getElementById('cv-exp').textContent = d.expiry || '—';
+
+    const pcr = d.pcr || 0;
+    const [sent, col, pct] = pcrInfo(pcr);
+
+    const pcrEl1 = document.getElementById('cv-pcr');
+    const pcrEl2 = document.getElementById('pcr-big');
+    if(pcrEl1){ pcrEl1.textContent = pcr.toFixed(4); pcrEl1.style.color = col; }
+    if(pcrEl2){ pcrEl2.textContent = pcr.toFixed(4); pcrEl2.style.color = col; }
+
+    document.getElementById('cv-pcr-s').textContent      = sent;
+    document.getElementById('pcr-fill').style.width      = pct+'%';
+    document.getElementById('pcr-fill').style.background = col;
+    document.getElementById('pcr-sent').textContent      = sent;
+    document.getElementById('pcr-sent').style.color      = col;
+
+    cachedRows = d.rows || [];
+    const mxCE = Math.max(...cachedRows.map(r => r.ce_oi||0), 1);
+    const mxPE = Math.max(...cachedRows.map(r => r.pe_oi||0), 1);
+    document.getElementById('oi-tbody').innerHTML = cachedRows.map(r => buildRow(r, mxCE, mxPE)).join('');
+    document.getElementById('foot-tce').textContent = 'Total CE: ' + fmtK(d.total_ce);
+    document.getElementById('foot-tpe').textContent = 'Total PE: ' + fmtK(d.total_pe);
+    const fp = document.getElementById('foot-pcr');
+    if(fp){ fp.textContent = 'PCR: '+pcr.toFixed(4); fp.style.color = col; }
+
+    const tsNow = d.ts_chart || (
+      new Date().toLocaleDateString('en-IN',{day:'2-digit',month:'short'}).replace(' ','-')
+      + ' '
+      + new Date().toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit',hour12:false})
+    );
+
+    appendLivePoint(cachedRows, tsNow);
+    buildStrikeButtons(cachedRows, d.atm);
+    buildPvStrikeCol(cachedRows, d.atm);
+
+    if(chartStrike !== null){
+      if(chartStrike === 'TOTAL'){
+        renderChart('TOTAL');
+      } else if(chartStrike === 'OTM'){
+        renderChart('OTM');
+      } else if(localHistory[chartStrike]){
+        renderChart(chartStrike);
+      }
+    }
+
+  } catch(e){
+    console.error('[OI] fetchOI error:', e);
     document.getElementById('err-box').style.display='block';
     document.getElementById('err-box').textContent='JS Error in fetchOI: '+e.message;
   }
 }
 
+/* ── LTP fetch ── */
 async function fetchLTP(){
   try{
     const res=await fetch('/api/ltp');const data=await res.json();
     const now=new Date().toLocaleTimeString('en-IN');
     const sv=data['NSE:NIFTY 50'];
-    if(sv!==undefined){const el=document.getElementById('cv-spot');const pv=prevLTP['NSE:NIFTY 50'];el.textContent=fmtP(sv);if(pv!==undefined)el.style.color=sv>pv?'var(--ce)':sv<pv?'var(--pe)':'var(--gold)';document.getElementById('cv-spot-t').textContent='as of '+now;prevLTP['NSE:NIFTY 50']=sv;}
+    if(sv!==undefined){
+      const el=document.getElementById('cv-spot');const pv=prevLTP['NSE:NIFTY 50'];
+      el.textContent=fmtP(sv);
+      if(pv!==undefined)el.style.color=sv>pv?'var(--ce)':sv<pv?'var(--pe)':'var(--gold)';
+      document.getElementById('cv-spot-t').textContent='as of '+now;
+      prevLTP['NSE:NIFTY 50']=sv;
+    }
     for(const r of cachedRows){
-      const cev=data[r.ce_sym]; if(cev!==undefined){const el=document.getElementById('celtp'+r.strike);if(el){flash('cetd'+r.strike,cev,prevLTP[r.ce_sym]);el.textContent=fmtP(cev);prevLTP[r.ce_sym]=cev;}}
-      const pev=data[r.pe_sym]; if(pev!==undefined){const el=document.getElementById('peltp'+r.strike);if(el){flash('petd'+r.strike,pev,prevLTP[r.pe_sym]);el.textContent=fmtP(pev);prevLTP[r.pe_sym]=pev;}}
+      const cev=data[r.ce_sym];
+      if(cev!==undefined){const el=document.getElementById('celtp'+r.strike);if(el){flash('cetd'+r.strike,cev,prevLTP[r.ce_sym]);el.textContent=fmtP(cev);prevLTP[r.ce_sym]=cev;}}
+      const pev=data[r.pe_sym];
+      if(pev!==undefined){const el=document.getElementById('peltp'+r.strike);if(el){flash('petd'+r.strike,pev,prevLTP[r.pe_sym]);el.textContent=fmtP(pev);prevLTP[r.pe_sym]=pev;}}
     }
   }catch(e){}
 }
 
-/* ── Price / VWAP ── */
-let pvStrike=null; let pvTf=1; let ceChart=null; let peChart=null; let pvInterval=null;
-let pvCeSym=''; let pvPeSym='';
+/* ════════════════════════════════════════════════════════════
+   PRICE / VWAP CHARTS
+════════════════════════════════════════════════════════════ */
+let pvStrike   = null;   // currently selected strike for price/vwap
+let pvTf       = 1;      // timeframe in minutes (1,3,5,10)
+let ceChart    = null;
+let peChart    = null;
+let pvInterval = null;   // auto-refresh handle
 
-function setPvTf(tf){pvTf=tf;document.querySelectorAll('.tf-btn').forEach(b=>b.classList.toggle('active',parseInt(b.dataset.tf)===tf));document.getElementById('pv-foot-tf').textContent=tf+' min';if(pvStrike) loadPvData(pvStrike,pvCeSym,pvPeSym);}
+function setPvTf(tf){
+  pvTf = tf;
+  document.querySelectorAll('.tf-btn').forEach(b=>{
+    b.classList.toggle('active', parseInt(b.dataset.tf)===tf);
+  });
+  document.getElementById('pv-foot-tf').textContent = tf + ' min';
+  if(pvStrike) loadPvData(pvStrike, pvCeSym, pvPeSym);
+}
 
+/* Build/rebuild the vertical strike selector in the centre column */
 function buildPvStrikeCol(rows, atm){
-  const col=document.getElementById('pv-strike-col');
-  const keys=rows.map(r=>r.strike).join(',');
-  if(col.dataset.keys!==keys){
-    col.dataset.keys=keys; col.innerHTML='<div class="pv-sk-lbl">Strike</div>';
+  const col  = document.getElementById('pv-strike-col');
+  const keys = rows.map(r=>r.strike).join(',');
+
+  if(col.dataset.keys !== keys){
+    col.dataset.keys = keys;
+    col.innerHTML = '<div class="pv-sk-lbl">Strike</div>';
     rows.forEach(r=>{
-      const btn=document.createElement('button');
-      const off=r.strike-atm; const isAtm=off===0;
-      btn.textContent=r.strike; btn.title=isAtm?'★ ATM':(off>0?`CE +${off}`:`PE ${off}`);
-      btn.className='pv-sk-btn'+(isAtm?' pv-sk-atm':'');
-      btn.dataset.strike=r.strike; btn.dataset.ceSym=r.ce_sym; btn.dataset.peSym=r.pe_sym;
-      btn.onclick=()=>selectPvStrike(parseInt(r.strike),r.ce_sym,r.pe_sym,btn);
+      const btn    = document.createElement('button');
+      const off    = r.strike - atm;
+      const isAtm  = off === 0;
+      btn.textContent        = r.strike;
+      btn.title              = isAtm ? '★ ATM' : (off>0?`CE +${off}`:`PE ${off}`);
+      btn.className          = 'pv-sk-btn' + (isAtm?' pv-sk-atm':'');
+      btn.dataset.strike     = r.strike;
+      btn.dataset.ceSym      = r.ce_sym;   // e.g. "NFO:NIFTY26327{strike}CE"
+      btn.dataset.peSym      = r.pe_sym;
+      btn.onclick            = ()=>selectPvStrike(parseInt(r.strike), r.ce_sym, r.pe_sym, btn);
       col.appendChild(btn);
     });
-    if(pvStrike===null){const atmBtn=col.querySelector('.pv-sk-atm');if(atmBtn){const r=rows.find(x=>x.strike===atm);if(r) selectPvStrike(atm,r.ce_sym,r.pe_sym,atmBtn);}return;}
+
+    if(pvStrike === null){
+      const atmBtn = col.querySelector('.pv-sk-atm');
+      if(atmBtn){
+        const r = rows.find(x=>x.strike===atm);
+        if(r) selectPvStrike(atm, r.ce_sym, r.pe_sym, atmBtn);
+      }
+      return;
+    }
   }
-  col.querySelectorAll('.pv-sk-btn').forEach(b=>b.classList.toggle('active',parseInt(b.dataset.strike)===pvStrike));
+
+  col.querySelectorAll('.pv-sk-btn').forEach(b=>{
+    b.classList.toggle('active', parseInt(b.dataset.strike) === pvStrike);
+  });
 }
 
-function selectPvStrike(strike,ceSym,peSym,btnEl){
+/* stored symbols for current PV selection */
+let pvCeSym = '';
+let pvPeSym = '';
+
+function selectPvStrike(strike, ceSym, peSym, btnEl){
   document.querySelectorAll('#pv-strike-col .pv-sk-btn').forEach(b=>b.classList.remove('active'));
   if(btnEl) btnEl.classList.add('active');
-  pvStrike=parseInt(strike); pvCeSym=ceSym; pvPeSym=peSym;
-  loadPvData(pvStrike,ceSym,peSym);
+  pvStrike = parseInt(strike);
+  pvCeSym  = ceSym;
+  pvPeSym  = peSym;
+  loadPvData(pvStrike, ceSym, peSym);
 }
 
+/* ── Chart.js factory for a price+VWAP panel ── */
 function makePvChart(canvasId, priceColor, vwapColor){
-  const p=palette(); const ctx=document.getElementById(canvasId).getContext('2d');
-  const nowLinePlugin={id:'nowLine',afterDraw(chart){
-    const priceData=chart.data.datasets[0].data; if(!priceData||!priceData.length) return;
-    let lastReal=-1; for(let i=priceData.length-1;i>=0;i--){if(priceData[i]!==null&&priceData[i]!==undefined){lastReal=i;break;}}
-    if(lastReal<0) return;
-    const xAxis=chart.scales.x; const yAxis=chart.scales.y; const ctx2=chart.ctx;
-    const top=yAxis.top; const bottom=yAxis.bottom; const right=xAxis.right;
-    if(lastReal<priceData.length-1){
-      const xNow=xAxis.getPixelForValue(lastReal); ctx2.save();
-      const futureAlpha=isDayMode?0.06:0.08;
-      ctx2.fillStyle=isDayMode?'rgba(0,0,0,'+futureAlpha+')':'rgba(255,255,255,'+futureAlpha+')';
-      ctx2.fillRect(xNow,top,right-xNow,bottom-top);
-      ctx2.strokeStyle=isDayMode?'rgba(154,103,0,0.80)':'rgba(251,191,36,0.80)'; ctx2.lineWidth=1.5; ctx2.setLineDash([]);
-      ctx2.beginPath(); ctx2.moveTo(xNow,top); ctx2.lineTo(xNow,bottom); ctx2.stroke();
-      const timeLabel=chart.data.labels[lastReal]||'';
-      ctx2.fillStyle=isDayMode?'rgba(154,103,0,0.90)':'rgba(251,191,36,0.90)';
-      ctx2.font="bold 9px 'IBM Plex Mono', monospace"; ctx2.textAlign='center'; ctx2.fillText(timeLabel,xNow,bottom+12);
-      ctx2.restore();
+  const p   = palette();
+  const ctx = document.getElementById(canvasId).getContext('2d');
+
+  /* Inline plugin: draws current-time marker + shades the future (null) region */
+  const nowLinePlugin = {
+    id: 'nowLine',
+    afterDraw(chart){
+      const priceData = chart.data.datasets[0].data;
+      if(!priceData || !priceData.length) return;
+
+      /* Find last index with real (non-null) data */
+      let lastReal = -1;
+      for(let i = priceData.length - 1; i >= 0; i--){
+        if(priceData[i] !== null && priceData[i] !== undefined){ lastReal = i; break; }
+      }
+      if(lastReal < 0) return;
+
+      const xAxis  = chart.scales.x;
+      const yAxis  = chart.scales.y;
+      const ctx2   = chart.ctx;
+      const top    = yAxis.top;
+      const bottom = yAxis.bottom;
+      const right  = xAxis.right;
+
+      /* Only draw "now" marker if we're not yet at end of day */
+      if(lastReal < priceData.length - 1){
+        const xNow = xAxis.getPixelForValue(lastReal);
+
+        ctx2.save();
+
+        /* Shade future area (right of now marker) */
+        const futureAlpha = isDayMode ? 0.06 : 0.08;
+        ctx2.fillStyle = isDayMode
+          ? 'rgba(0,0,0,'+futureAlpha+')'
+          : 'rgba(255,255,255,'+futureAlpha+')';
+        ctx2.fillRect(xNow, top, right - xNow, bottom - top);
+
+        /* NOW vertical line — gold, solid */
+        ctx2.strokeStyle = isDayMode ? 'rgba(154,103,0,0.80)' : 'rgba(251,191,36,0.80)';
+        ctx2.lineWidth   = 1.5;
+        ctx2.setLineDash([]);
+        ctx2.beginPath();
+        ctx2.moveTo(xNow, top);
+        ctx2.lineTo(xNow, bottom);
+        ctx2.stroke();
+
+        /* "NOW" label at the bottom of the line */
+        const timeLabel = chart.data.labels[lastReal] || '';
+        ctx2.fillStyle  = isDayMode ? 'rgba(154,103,0,0.90)' : 'rgba(251,191,36,0.90)';
+        ctx2.font       = "bold 9px 'IBM Plex Mono', monospace";
+        ctx2.textAlign  = 'center';
+        ctx2.fillText(timeLabel, xNow, bottom + 12);
+
+        ctx2.restore();
+      }
     }
-  }};
-  return new Chart(ctx,{
-    type:'line', plugins:[nowLinePlugin],
-    data:{labels:[],datasets:[
-      {label:'Price',data:[],yAxisID:'y',borderColor:priceColor,borderWidth:2,pointRadius:0,pointHoverRadius:6,pointHoverBackgroundColor:priceColor,pointHoverBorderColor:'#fff',pointHoverBorderWidth:2,tension:0.3,fill:false,spanGaps:false},
-      {label:'VWAP', data:[],yAxisID:'y',borderColor:vwapColor, borderWidth:1.8,borderDash:[5,4],pointRadius:0,pointHoverRadius:5,pointHoverBackgroundColor:vwapColor,tension:0.3,fill:false,spanGaps:false},
-    ]},
-    options:{responsive:true,maintainAspectRatio:false,animation:{duration:300},layout:{padding:{bottom:18}},interaction:{mode:'index',intersect:false},
-      plugins:{legend:{display:false},tooltip:{backgroundColor:p.tip,borderColor:p.tipbrd,borderWidth:1,titleColor:p.ttitle,bodyColor:p.tbody,padding:12,titleFont:{family:"'IBM Plex Mono'",size:11,weight:'700'},bodyFont:{family:"'IBM Plex Mono'",size:11},filter:item=>item.raw!==null&&item.raw!==undefined,callbacks:{title:items=>items[0].label,label:item=>item.raw!=null?'  '+item.dataset.label+': Rs.'+Number(item.raw).toFixed(2):''}}},
-      scales:{x:{grid:{display:false},ticks:{color:p.tick,font:{family:"'IBM Plex Mono'",size:10},maxRotation:0,autoSkip:false,callback(val,idx){const lbl=this.getLabelForValue(val);if(!lbl)return '';const[hh,mm]=lbl.split(':').map(Number);if(lbl==='09:15'||lbl==='15:30') return lbl;if(mm===0) return lbl;return '';}},border:{color:cssv('--brd')}},y:{position:'right',grid:{display:false},ticks:{color:p.tick,font:{family:"'IBM Plex Mono'",size:10},callback:v=>v!=null?'Rs.'+Number(v).toFixed(0):''},border:{color:cssv('--brd')}}}
+  };
+
+  return new Chart(ctx, {
+    type:'line',
+    plugins:[nowLinePlugin],
+    data:{
+      labels:[],
+      datasets:[
+        {
+          label:'Price', data:[], yAxisID:'y',
+          borderColor:priceColor, borderWidth:2,
+          pointRadius:0, pointHoverRadius:6,
+          pointHoverBackgroundColor:priceColor,
+          pointHoverBorderColor:'#fff', pointHoverBorderWidth:2,
+          tension:0.3, fill:false,
+          spanGaps:false,   /* gaps for null = future slots show as blank */
+        },
+        {
+          label:'VWAP', data:[], yAxisID:'y',
+          borderColor:vwapColor, borderWidth:1.8,
+          borderDash:[5,4],
+          pointRadius:0, pointHoverRadius:5,
+          pointHoverBackgroundColor:vwapColor,
+          tension:0.3, fill:false,
+          spanGaps:false,
+        },
+      ]
+    },
+    options:{
+      responsive:true, maintainAspectRatio:false, animation:{duration:300},
+      layout:{ padding:{ bottom: 18 } },
+      interaction:{mode:'index',intersect:false},
+      plugins:{
+        legend:{display:false},
+        tooltip:{
+          backgroundColor:p.tip, borderColor:p.tipbrd, borderWidth:1,
+          titleColor:p.ttitle, bodyColor:p.tbody, padding:12,
+          titleFont:{family:"'IBM Plex Mono'",size:11,weight:'700'},
+          bodyFont:{family:"'IBM Plex Mono'",size:11},
+          filter: item => item.raw !== null && item.raw !== undefined,
+          callbacks:{
+            title : items=> items[0].label,
+            label : item => item.raw != null
+              ? '  '+item.dataset.label+': Rs.'+Number(item.raw).toFixed(2)
+              : '',
+          }
+        }
+      },
+      scales:{
+        x:{
+          grid:{display:false},
+          ticks:{
+            color:p.tick, font:{family:"'IBM Plex Mono'",size:10},
+            maxRotation:0, autoSkip:false,
+            callback(val, idx){
+              const lbl = this.getLabelForValue(val);
+              if(!lbl) return '';
+              const [hh, mm] = lbl.split(':').map(Number);
+              /* Always show market open, market close, and every round hour */
+              if(lbl === '09:15' || lbl === '15:30') return lbl;
+              if(mm === 0) return lbl;
+              return '';
+            }
+          },
+          border:{color:cssv('--brd')},
+        },
+        y:{
+          position:'right',
+          grid:{display:false},
+          ticks:{
+            color:p.tick, font:{family:"'IBM Plex Mono'",size:10},
+            callback:v => v != null ? 'Rs.'+Number(v).toFixed(0) : ''
+          },
+          border:{color:cssv('--brd')},
+        }
+      }
     }
   });
 }
@@ -1752,57 +2581,123 @@ function makePvChart(canvasId, priceColor, vwapColor){
 function updatePvChartColors(chart, priceColor, vwapColor){
   if(!chart) return;
   const p=palette();
-  chart.data.datasets[0].borderColor=priceColor; chart.data.datasets[0].pointHoverBackgroundColor=priceColor;
+  chart.data.datasets[0].borderColor=priceColor;
+  chart.data.datasets[0].pointHoverBackgroundColor=priceColor;
   chart.data.datasets[1].borderColor=vwapColor;
-  chart.options.plugins.tooltip.backgroundColor=p.tip; chart.options.plugins.tooltip.borderColor=p.tipbrd;
-  chart.options.plugins.tooltip.titleColor=p.ttitle; chart.options.plugins.tooltip.bodyColor=p.tbody;
-  chart.options.scales.x.ticks.color=p.tick; chart.options.scales.x.border.color=cssv('--brd');
-  chart.options.scales.y.ticks.color=p.tick; chart.options.scales.y.border.color=cssv('--brd');
+  chart.options.plugins.tooltip.backgroundColor=p.tip;
+  chart.options.plugins.tooltip.borderColor=p.tipbrd;
+  chart.options.plugins.tooltip.titleColor=p.ttitle;
+  chart.options.plugins.tooltip.bodyColor=p.tbody;
+  chart.options.scales.x.ticks.color=p.tick;
+  chart.options.scales.x.border.color=cssv('--brd');
+  chart.options.scales.y.ticks.color=p.tick;
+  chart.options.scales.y.border.color=cssv('--brd');
   chart.update('none');
 }
 
 function renderPvChart(chartRef, canvasId, phId, spinId, series, latestPrice, latestVwap, metaPriceId, metaVwapId){
-  const ph=document.getElementById(phId); const spin=document.getElementById(spinId); const cv=document.getElementById(canvasId);
+  const ph   = document.getElementById(phId);
+  const spin = document.getElementById(spinId);
+  const cv   = document.getElementById(canvasId);
   spin.classList.remove('show');
-  if(!series||series.ts.length===0){ph.style.display='flex';cv.style.display='none';return null;}
-  ph.style.display='none'; cv.style.display='block'; cv.style.height='360px';
-  if(!chartRef){const isCe=canvasId==='ce-chart';chartRef=makePvChart(canvasId,isCe?cssv('--ce'):cssv('--pe'),isCe?'#a0e8ff':'#ffb3c8');chartRef.resize();}
-  chartRef.data.labels=[...series.ts]; chartRef.data.datasets[0].data=[...series.price]; chartRef.data.datasets[1].data=[...series.vwap];
+
+  if(!series || series.ts.length===0){
+    ph.style.display='flex'; cv.style.display='none'; return null;
+  }
+  ph.style.display='none';
+  cv.style.display='block';
+  cv.style.height='360px';
+
+  if(!chartRef){
+    const isCe = canvasId==='ce-chart';
+    const priceCol = isCe ? cssv('--ce')      : cssv('--pe');
+    const vwapCol  = isCe ? '#a0e8ff'          : '#ffb3c8';
+    chartRef = makePvChart(canvasId, priceCol, vwapCol);
+    chartRef.resize();
+  }
+
+  chartRef.data.labels            = [...series.ts];
+  chartRef.data.datasets[0].data  = [...series.price];
+  chartRef.data.datasets[1].data  = [...series.vwap];
   chartRef.update();
-  if(latestPrice!=null) document.getElementById(metaPriceId).textContent='₹'+latestPrice.toFixed(2);
-  if(latestVwap !=null) document.getElementById(metaVwapId ).textContent='₹'+latestVwap.toFixed(2);
+
+  /* Update meta pills */
+  if(latestPrice!=null) document.getElementById(metaPriceId).textContent = '₹'+latestPrice.toFixed(2);
+  if(latestVwap !=null) document.getElementById(metaVwapId ).textContent = '₹'+latestVwap.toFixed(2);
+
   return chartRef;
 }
 
 async function loadPvData(strike, ceSym, peSym){
-  ceSym=ceSym||pvCeSym; peSym=peSym||pvPeSym;
-  if(!ceSym||!peSym){console.warn('PV: no symbols for strike',strike);return;}
+  ceSym = ceSym || pvCeSym;
+  peSym = peSym || pvPeSym;
+  if(!ceSym || !peSym){
+    console.warn('PV: no symbols available yet for strike', strike);
+    return;
+  }
+
   document.getElementById('pv-ce-spin').classList.add('show');
   document.getElementById('pv-pe-spin').classList.add('show');
   document.getElementById('pv-ce-ph').style.display='none';
   document.getElementById('pv-pe-ph').style.display='none';
+
   try{
-    const url=`/api/price_vwap?ce_sym=${encodeURIComponent(ceSym)}&pe_sym=${encodeURIComponent(peSym)}&tf=${pvTf}`;
-    const res=await fetch(url); const data=await res.json();
+    const url  = `/api/price_vwap?ce_sym=${encodeURIComponent(ceSym)}&pe_sym=${encodeURIComponent(peSym)}&tf=${pvTf}`;
+    const res  = await fetch(url);
+    const data = await res.json();
     if(data.error){
       ['pv-ce-spin','pv-pe-spin'].forEach(id=>document.getElementById(id).classList.remove('show'));
-      ['pv-ce-ph','pv-pe-ph'].forEach(id=>{const el=document.getElementById(id);el.style.display='flex';const p=el.querySelector('p');if(p) p.innerHTML=`<span style="font-size:.6rem;color:var(--err-cl)">${data.error}</span>`;});
+      ['pv-ce-ph','pv-pe-ph'].forEach(id=>{
+        const el=document.getElementById(id);
+        el.style.display='flex';
+        const p=el.querySelector('p');
+        if(p) p.innerHTML=`<span style="font-size:.6rem;color:var(--err-cl)">${data.error}</span>`;
+      });
       return;
     }
-    const lastReal=arr=>{for(let i=arr.length-1;i>=0;i--){if(arr[i]!=null)return arr[i];}return null;};
-    ceChart=renderPvChart(ceChart,'ce-chart','pv-ce-ph','pv-ce-spin',data.ce,lastReal(data.ce.price),lastReal(data.ce.vwap),'pv-ce-ltp','pv-ce-vwap');
-    peChart=renderPvChart(peChart,'pe-chart','pv-pe-ph','pv-pe-spin',data.pe,lastReal(data.pe.price),lastReal(data.pe.vwap),'pv-pe-ltp','pv-pe-vwap');
-    document.getElementById('pv-foot-strike').textContent=strike;
-    document.getElementById('pv-foot-tf').textContent=pvTf+' min';
-    document.getElementById('pv-foot-ce-pts').textContent=data.ce.ts.length;
-    document.getElementById('pv-foot-pe-pts').textContent=data.pe.ts.length;
-  }catch(e){console.warn('PV fetch error:',e);['pv-ce-spin','pv-pe-spin'].forEach(id=>document.getElementById(id).classList.remove('show'));}
+
+    /* Find the last non-null price/vwap (array has nulls for future slots) */
+    const lastReal = arr => { for(let i=arr.length-1;i>=0;i--){ if(arr[i]!=null) return arr[i]; } return null; };
+
+    ceChart = renderPvChart(
+      ceChart,'ce-chart','pv-ce-ph','pv-ce-spin',
+      data.ce,
+      lastReal(data.ce.price), lastReal(data.ce.vwap),
+      'pv-ce-ltp','pv-ce-vwap'
+    );
+    peChart = renderPvChart(
+      peChart,'pe-chart','pv-pe-ph','pv-pe-spin',
+      data.pe,
+      lastReal(data.pe.price), lastReal(data.pe.vwap),
+      'pv-pe-ltp','pv-pe-vwap'
+    );
+
+    document.getElementById('pv-foot-strike').textContent = strike;
+    document.getElementById('pv-foot-tf').textContent     = pvTf+' min';
+    document.getElementById('pv-foot-ce-pts').textContent = data.ce.ts.length;
+    document.getElementById('pv-foot-pe-pts').textContent = data.pe.ts.length;
+
+  } catch(e){
+    console.warn('PV fetch error:',e);
+    ['pv-ce-spin','pv-pe-spin'].forEach(id=>document.getElementById(id).classList.remove('show'));
+  }
 }
 
-function startPvRefresh(){ if(pvInterval) clearInterval(pvInterval); pvInterval=setInterval(()=>{if(pvStrike&&pvCeSym) loadPvData(pvStrike,pvCeSym,pvPeSym);},60000); }
+/* Auto-refresh price/vwap every 60 sec */
+function startPvRefresh(){
+  if(pvInterval) clearInterval(pvInterval);
+  pvInterval = setInterval(()=>{ if(pvStrike && pvCeSym) loadPvData(pvStrike, pvCeSym, pvPeSym); }, 60000);
+}
 
-async function boot(){ await fetchOI(); setInterval(fetchOI,OI_INT*1000); setTimeout(()=>{fetchLTP();setInterval(fetchLTP,LTP_INT*1000);},900); }
-boot(); startPvRefresh();
+/* ── Boot ── */
+async function boot(){
+  await fetchOI();
+  setInterval(fetchOI, OI_INT * 1000);
+  setTimeout(()=>{ fetchLTP(); setInterval(fetchLTP, LTP_INT * 1000); }, 900);
+}
+
+boot();
+startPvRefresh();
 </script>
 </body>
 </html>"""
@@ -1814,17 +2709,21 @@ def index():
 
 
 # ═══════════════════════════════════════════════════════════
-#  ENTRY POINT
+#  ENTRY POINT  (python oi_dashboard.py)
 # ═══════════════════════════════════════════════════════════
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     print("="*62)
-    print("  NIFTY OI Dashboard  v5  (Render-Ready)")
+    print("  NIFTY OI Dashboard  v5  (4-Day History Chart)")
     print(f"  OI refresh : {OI_INTERVAL}s   LTP refresh : {LTP_INTERVAL}s")
     print(f"  Strikes    : ATM±{OTM_DEPTH}  ({2*OTM_DEPTH+1} rows total)")
+    print("  Fixes: oi_loop sleeps first · prev==0 → shows NEW")
+    print("  New  : /api/historical_oi   · 4-day OI chart")
     print("="*62)
+
     print("  → Fetching instruments + initial OI …")
     fetch_oi()
+
     if error_msg:
         print(f"\n  ⚠  ERROR: {error_msg}\n")
     else:
@@ -1833,29 +2732,31 @@ if __name__ == "__main__":
         print(f"  ✓  Symbols  = {len(ltp_symbols)} tracked")
         print(f"  ✓  Tokens   = {len(_token_map)} loaded for historical")
         print(f"  ✓  History  = {len(oi_history)} strikes tracked")
+
     threading.Thread(target=oi_loop,  daemon=True, name="OI-Thread").start()
     threading.Thread(target=ltp_loop, daemon=True, name="LTP-Thread").start()
+
     print(f"\n  ▶  Open browser →  http://localhost:{port}\n")
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
 
-# ── Gunicorn entry point (used by Render) ─────────────────
-# Gunicorn calls app directly; startup threads are NOT started
-# automatically. Use Render's startCommand with a preload hook,
-# or rely on the startup_hook below.
-def _start_background_threads():
-    """Called once by gunicorn post-fork via on_starting hook (or at import time)."""
+
+# ═══════════════════════════════════════════════════════════
+#  GUNICORN ENTRY POINT  (used by Render)
+#  Gunicorn imports this module and calls app directly.
+#  The __name__ == "__main__" block above does NOT run.
+#  This section starts the background threads at import time.
+# ═══════════════════════════════════════════════════════════
+_threads_started = False
+
+def _start_threads_once():
+    global _threads_started
+    if _threads_started:
+        return
+    _threads_started = True
+    print("  [GUNICORN] Starting background threads + initial OI fetch …")
     fetch_oi()
     threading.Thread(target=oi_loop,  daemon=True, name="OI-Thread").start()
     threading.Thread(target=ltp_loop, daemon=True, name="LTP-Thread").start()
+    print("  [GUNICORN] Threads started.")
 
-# Auto-start when imported by gunicorn (single-worker mode recommended)
-import atexit as _atexit
-_threads_started = False
-
-def _ensure_threads():
-    global _threads_started
-    if not _threads_started:
-        _threads_started = True
-        _start_background_threads()
-
-_ensure_threads()
+_start_threads_once()
