@@ -373,6 +373,7 @@ def _merge_hist_with_live(strike: int, hist: dict) -> dict:
 
 def fetch_oi():
     global oi_data, last_oi_time, error_msg, ltp_symbols, _prev_oi
+    print(f"  [fetch_oi] Starting …")
     try:
         expiry = get_nearest_expiry()
         spot   = get_spot()
@@ -446,6 +447,7 @@ def fetch_oi():
     except Exception as e:
         import traceback; traceback.print_exc()
         error_msg = str(e)
+        print(f"  [fetch_oi] ERROR: {e}")
 
 
 def oi_loop():
@@ -524,6 +526,32 @@ def api_oi():
 @app.route("/api/ltp")
 def api_ltp():
     return jsonify(ltp_data)
+
+
+@app.route("/api/status")
+def api_status():
+    """Diagnostic endpoint — open in browser to see what is running."""
+    import threading as _t
+    thread_names = [t.name for t in _t.enumerate()]
+    return jsonify({
+        "oi_data_populated"  : bool(oi_data.get("atm")),
+        "last_oi_time"       : last_oi_time,
+        "error_msg"          : error_msg,
+        "ltp_symbols_count"  : len(ltp_symbols),
+        "oi_history_strikes" : len(oi_history),
+        "running_threads"    : thread_names,
+        "nearest_expiry"     : str(_nearest_expiry),
+        "instrument_map_size": len(_instrument_map),
+        "atm"                : oi_data.get("atm"),
+    })
+
+
+@app.route("/api/trigger")
+def api_trigger():
+    """Manually trigger fetch_oi() — for debugging only."""
+    import threading as _t
+    _t.Thread(target=fetch_oi, daemon=True, name="ManualTrigger").start()
+    return jsonify({"triggered": True, "message": "fetch_oi() started in background"})
 
 
 @app.route("/api/historical_oi")
@@ -2739,7 +2767,9 @@ def index():
 
 def _oi_loop_with_initial():
     """Fetch OI immediately (no sleep first), then repeat every OI_INTERVAL."""
+    print(f"  [OI-Thread pid={os.getpid()}] Thread alive, calling fetch_oi() now …")
     fetch_oi()
+    print(f"  [OI-Thread] First fetch_oi() done. error_msg={error_msg}")
     time.sleep(OI_INTERVAL)
     while True:
         fetch_oi()
