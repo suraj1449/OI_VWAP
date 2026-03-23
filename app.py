@@ -2743,40 +2743,15 @@ if __name__ == "__main__":
     print("  New  : /api/historical_oi   · 4-day OI chart")
     print("="*62)
 
-    print("  → Fetching instruments + initial OI …")
-    fetch_oi()
-
-    if error_msg:
-        print(f"\n  ⚠  ERROR: {error_msg}\n")
-    else:
-        print(f"\n  ✓  Expiry   = {oi_data.get('expiry')}")
-        print(f"  ✓  ATM      = {oi_data.get('atm')}")
-        print(f"  ✓  Symbols  = {len(ltp_symbols)} tracked")
-        print(f"  ✓  Tokens   = {len(_token_map)} loaded for historical")
-        print(f"  ✓  History  = {len(oi_history)} strikes tracked")
-
-    # oi_loop sleeps first; for __main__ we already called fetch_oi() above
-    threading.Thread(target=oi_loop,  daemon=True, name="OI-Thread").start()
-    threading.Thread(target=ltp_loop, daemon=True, name="LTP-Thread").start()
+    start_background_threads()
 
     print(f"\n  ▶  Open browser →  http://localhost:{port}\n")
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
 
 
 # ═══════════════════════════════════════════════════════════
-#  THREAD STARTUP  —  works for both  python run  and  gunicorn
-#
-#  WHY NOT module-level _start_threads_once():
-#    Gunicorn always forks a worker from the master process.
-#    Threads started in the master DIE after fork.
-#    The _threads_started flag is already True in the child
-#    (copied from parent memory), so the old approach was a
-#    no-op in the worker → zero threads → oi_data stays {}.
-#
-#  FIX: @app.before_request + PID check.
-#    Fires inside the actual worker process on the very first
-#    HTTP request.  PID comparison guarantees it re-fires
-#    correctly after any fork.
+#  THREAD HELPER — used by gunicorn.conf.py post_fork hook
+#  and also by the __main__ block below.
 # ═══════════════════════════════════════════════════════════
 
 def _oi_loop_with_initial():
@@ -2788,21 +2763,9 @@ def _oi_loop_with_initial():
         time.sleep(OI_INTERVAL)
 
 
-_threads_pid  = None
-_threads_lock = threading.Lock()
-
-@app.before_request
-def _ensure_threads():
-    """Start background threads in whichever worker process handles the first request."""
-    global _threads_pid
-    pid = os.getpid()
-    if _threads_pid == pid:
-        return                          # already running in this process — fast path
-    with _threads_lock:
-        if _threads_pid == pid:         # double-checked locking
-            return
-        _threads_pid = pid
-        print(f"  [INIT pid={pid}] Starting OI + LTP threads …")
-        threading.Thread(target=_oi_loop_with_initial, daemon=True, name="OI-Thread").start()
-        threading.Thread(target=ltp_loop,              daemon=True, name="LTP-Thread").start()
-        print(f"  [INIT pid={pid}] Threads started.")
+def start_background_threads():
+    """Start OI + LTP threads. Called from gunicorn post_fork or __main__."""
+    print(f"  [THREADS pid={os.getpid()}] Starting OI + LTP threads …")
+    threading.Thread(target=_oi_loop_with_initial, daemon=True, name="OI-Thread").start()
+    threading.Thread(target=ltp_loop,              daemon=True, name="LTP-Thread").start()
+    print(f"  [THREADS pid={os.getpid()}] Threads started.")
