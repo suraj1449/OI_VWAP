@@ -2733,43 +2733,12 @@ def index():
 # ═══════════════════════════════════════════════════════════
 #  ENTRY POINT  (python oi_dashboard.py)
 # ═══════════════════════════════════════════════════════════
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    print("="*62)
-    print("  NIFTY OI Dashboard  v5  (4-Day History Chart)")
-    print(f"  OI refresh : {OI_INTERVAL}s   LTP refresh : {LTP_INTERVAL}s")
-    print(f"  Strikes    : ATM±{OTM_DEPTH}  ({2*OTM_DEPTH+1} rows total)")
-    print("="*62)
-
-    # ── Fetch initial OI synchronously so page has data immediately ──
-    print("\n  → Fetching initial OI snapshot (may take 10-20 sec) …")
-    fetch_oi()
-    if error_msg:
-        print(f"  ⚠  OI fetch error: {error_msg}")
-        print("  ⚠  Dashboard will retry every 3 min. Check credentials.")
-    else:
-        print(f"  ✓  Expiry  = {oi_data.get('expiry')}")
-        print(f"  ✓  ATM     = {oi_data.get('atm')}")
-        print(f"  ✓  Tokens  = {len(_token_map)} loaded")
-
-    # ── Start background refresh threads ──────────────────────────────
-    # oi_loop sleeps OI_INTERVAL before its first call (initial done above)
-    threading.Thread(target=oi_loop,  daemon=True, name="OI-Thread").start()
-    threading.Thread(target=ltp_loop, daemon=True, name="LTP-Thread").start()
-    print("  ✓  Background threads started")
-
-    print(f"\n  ▶  Open browser →  http://localhost:{port}\n")
-    # threaded=True lets Flask handle concurrent LTP + OI requests
-    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
-
-
 # ═══════════════════════════════════════════════════════════
-#  THREAD HELPER — used by gunicorn.conf.py post_fork hook
-#  and also by the __main__ block below.
+#  OI LOOP — fetches immediately, then every OI_INTERVAL
 # ═══════════════════════════════════════════════════════════
 
 def _oi_loop_with_initial():
-    """Fetch OI immediately (no sleep), then repeat every OI_INTERVAL."""
+    """Fetch OI immediately (no sleep first), then repeat every OI_INTERVAL."""
     fetch_oi()
     time.sleep(OI_INTERVAL)
     while True:
@@ -2777,9 +2746,26 @@ def _oi_loop_with_initial():
         time.sleep(OI_INTERVAL)
 
 
-def start_background_threads():
-    """Start OI + LTP threads. Called from gunicorn post_fork or __main__."""
-    print(f"  [THREADS pid={os.getpid()}] Starting OI + LTP threads …")
+# ═══════════════════════════════════════════════════════════
+#  ENTRY POINT
+# ═══════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    print("="*62)
+    print("  NIFTY OI Dashboard  v5")
+    print(f"  OI refresh : {OI_INTERVAL}s   LTP refresh : {LTP_INTERVAL}s")
+    print(f"  Strikes    : ATM±{OTM_DEPTH}  ({2*OTM_DEPTH+1} rows total)")
+    print("="*62)
+
+    # ── IMPORTANT: start threads BEFORE app.run so Render sees the
+    #    port open within its 10-second health-check window.
+    #    fetch_oi() runs inside the thread (non-blocking here).
+    #    JS polls every 5 s until data arrives.
+    print(f"  [pid={os.getpid()}] Starting background threads …")
     threading.Thread(target=_oi_loop_with_initial, daemon=True, name="OI-Thread").start()
     threading.Thread(target=ltp_loop,              daemon=True, name="LTP-Thread").start()
-    print(f"  [THREADS pid={os.getpid()}] Threads started.")
+    print(f"  [pid={os.getpid()}] Threads started. Starting Flask …")
+
+    print(f"  ▶  Listening on port {port}\n")
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
