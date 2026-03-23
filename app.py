@@ -2690,9 +2690,31 @@ function startPvRefresh(){
 }
 
 /* ── Boot ── */
+/* Retry every 5 seconds until the server has OI data, then switch to
+   the normal 3-minute interval.  This prevents a blank page when the
+   server is still fetching instruments on a cold start.               */
+let _bootInterval = null;
+
 async function boot(){
+  // Immediate first attempt
   await fetchOI();
-  setInterval(fetchOI, OI_INT * 1000);
+
+  if(cachedRows.length > 0){
+    // Data already available — start normal 3-min cycle
+    setInterval(fetchOI, OI_INT * 1000);
+  } else {
+    // Server not ready yet — poll every 5 s until we get data
+    _bootInterval = setInterval(async ()=>{
+      await fetchOI();
+      if(cachedRows.length > 0){
+        clearInterval(_bootInterval);
+        _bootInterval = null;
+        // Switch to normal 3-min cycle from now
+        setInterval(fetchOI, OI_INT * 1000);
+      }
+    }, 5000);
+  }
+
   setTimeout(()=>{ fetchLTP(); setInterval(fetchLTP, LTP_INT * 1000); }, 900);
 }
 
@@ -2735,6 +2757,7 @@ if __name__ == "__main__":
 
     threading.Thread(target=oi_loop,  daemon=True, name="OI-Thread").start()
     threading.Thread(target=ltp_loop, daemon=True, name="LTP-Thread").start()
+    # Note: oi_loop sleeps OI_INTERVAL before first repeat (original design preserved)
 
     print(f"\n  ▶  Open browser →  http://localhost:{port}\n")
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
@@ -2748,15 +2771,23 @@ if __name__ == "__main__":
 # ═══════════════════════════════════════════════════════════
 _threads_started = False
 
+def _oi_loop_with_initial():
+    """Run fetch_oi immediately (no initial sleep), then hand off to normal oi_loop."""
+    fetch_oi()                    # first snapshot — no sleep before this one
+    time.sleep(OI_INTERVAL)
+    while True:
+        fetch_oi()
+        time.sleep(OI_INTERVAL)
+
 def _start_threads_once():
     global _threads_started
     if _threads_started:
         return
     _threads_started = True
-    print("  [GUNICORN] Starting background threads + initial OI fetch …")
-    fetch_oi()
-    threading.Thread(target=oi_loop,  daemon=True, name="OI-Thread").start()
-    threading.Thread(target=ltp_loop, daemon=True, name="LTP-Thread").start()
+    print("  [GUNICORN] Starting background threads (initial OI fetch is non-blocking) …")
+    # fetch_oi() runs inside the thread — does NOT block module import
+    threading.Thread(target=_oi_loop_with_initial, daemon=True, name="OI-Thread").start()
+    threading.Thread(target=ltp_loop,              daemon=True, name="LTP-Thread").start()
     print("  [GUNICORN] Threads started.")
 
 _start_threads_once()
