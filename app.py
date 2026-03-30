@@ -350,7 +350,7 @@ def fetch_oi():
         atm    = round_atm(spot)
         rows, syms = [], []
 
-        for offset in range(OTM_DEPTH, -OTM_DEPTH - 1, -1):
+        for offset in range(-OTM_DEPTH, OTM_DEPTH + 1):
             strike = atm + offset * STRIKE_GAP
             ce_k   = opt_sym(strike, "CE", expiry)
             pe_k   = opt_sym(strike, "PE", expiry)
